@@ -1,0 +1,14 @@
+# XcodeGen generates this from app/project.yml
+app/Barr.xcodeproj/
+
+# Build output
+build/
+DerivedData/
+app/build/
+app/DerivedData/
+*.dmg
+*.app
+*.xcuserstate
+xcuserdata/
+
+.DS_Store
