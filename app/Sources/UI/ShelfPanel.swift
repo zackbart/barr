@@ -34,15 +34,43 @@ final class ShelfPanel: NSPanel {
         guard let buttonWindow = button.window, let screen = buttonWindow.screen ?? NSScreen.main else {
             return false
         }
-        resizeToFit(on: screen)
         let buttonFrame = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        guard Self.isVisibleMenuBarFrame(buttonFrame, on: screen) else {
+            close()
+            return false
+        }
+
+        resizeToFit(on: screen)
         let minimumX = screen.visibleFrame.minX + 8
         let maximumX = max(minimumX, screen.visibleFrame.maxX - frame.width - 8)
         let x = min(max(minimumX, buttonFrame.midX - frame.width / 2), maximumX)
         let y = buttonFrame.minY - frame.height - 5
         setFrameOrigin(NSPoint(x: x, y: y))
         orderFrontRegardless()
+        makeKey()
         return true
+    }
+
+    private static func isVisibleMenuBarFrame(_ frame: CGRect, on screen: NSScreen) -> Bool {
+        guard frame.width > 0, frame.height > 0 else { return false }
+
+        let visibleWidth = screen.frame.intersection(frame).width
+        guard visibleWidth >= min(frame.width * 0.8, frame.width - 1) else {
+            return false
+        }
+
+        let menuBarAreas = [
+            screen.auxiliaryTopLeftArea,
+            screen.auxiliaryTopRightArea
+        ].compactMap { $0 }
+        guard !menuBarAreas.isEmpty else { return true }
+
+        // A status item's NSWindow still has valid on-screen geometry while it
+        // sits beneath a MacBook notch. Only anchor the shelf to an item that
+        // actually intersects one of the visible menu-bar regions.
+        return menuBarAreas.contains {
+            $0.intersection(frame).width >= min(frame.width * 0.8, frame.width - 1)
+        }
     }
 
     func resizeToFit(on targetScreen: NSScreen? = nil) {

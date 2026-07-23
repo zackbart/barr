@@ -20,16 +20,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var returnMonitor: Any?
     private var returnFallback: DispatchWorkItem?
     private var pendingReturn: (() -> Void)?
+    private var shelfGlobalDismissMonitor: Any?
+    private var shelfLocalDismissMonitor: Any?
     private var storageUpdateGeneration = 0
+    private var handledInitialRefresh = false
+    private var startupReconciliationComplete = false
+    private var startupShelfRequested = false
+    private var persistedItemReconciliationInProgress = false
+    private var runningApplicationsGeneration = 0
     private let collapsedStorageLength: CGFloat = 2
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItems()
+        startupReconciliationComplete = model.movedItemKeys.isEmpty
         refreshScannerExclusions()
         shelfPanel = ShelfPanel(model: model)
         model.onItemsChanged = { [weak self] in
-            self?.shelfPanel.resizeToFit()
-            self?.updateStorageState()
+            self?.itemsChanged()
+        }
+        model.onRefreshCompleted = { [weak self] in
+            self?.refreshCompleted()
         }
         model.onActivate = { [weak self] item in
             self?.activateFromShelf(item)
@@ -53,6 +63,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(runningApplicationsChanged),
+            name: NSWorkspace.didLaunchApplicationNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(runningApplicationsChanged),
+            name: NSWorkspace.didTerminateApplicationNotification,
+            object: nil
+        )
 
         if model.movedItemKeys.isEmpty {
             model.setManaging(true)
@@ -62,14 +84,199 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.model.refresh()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
-            self?.showShelf()
+            self?.requestStartupShelf()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         returnHiddenItemNow()
+        removeShelfDismissMonitors()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        showShelf()
+        return true
+    }
+
+    private func itemsChanged() {
+        shelfPanel.resizeToFit()
+        if startupReconciliationComplete {
+            updateStorageState()
+        } else {
+            storageAnchor.length = collapsedStorageLength
+            refreshScannerExclusions()
+        }
+    }
+
+    private func refreshCompleted() {
+        if !handledInitialRefresh {
+            handledInitialRefresh = true
+        }
+
+        if startupReconciliationComplete {
+            reconcileNewlyVisiblePersistedItems()
+            presentStartupShelfIfReady()
+            return
+        }
+
+        // Keep the parking boundary collapsed until Accessibility becomes
+        // available. The permissions UI must still be reachable, and the next
+        // successful permission refresh will resume restoration automatically.
+        guard PermissionCenter.isAccessibilityGranted else {
+            presentStartupShelfIfReady()
+            return
+        }
+        restorePersistedItemsAfterLaunch()
+    }
+
+    private func restorePersistedItemsAfterLaunch() {
+        guard !persistedItemReconciliationInProgress else { return }
+        persistedItemReconciliationInProgress = true
+        storageAnchor.length = collapsedStorageLength
+        refreshScannerExclusions()
+
+        guard
+            PermissionCenter.isAccessibilityGranted,
+            let anchorWindowID = windowID(for: storageAnchor)
+        else {
+            persistedItemReconciliationInProgress = false
+            finishStartupReconciliation()
+            return
+        }
+
+        let persistedItems = model.barrItems.filter(\.isMovableByBarr)
+        guard !persistedItems.isEmpty else {
+            persistedItemReconciliationInProgress = false
+            finishStartupReconciliation()
+            return
+        }
+
+        reconcile(
+            persistedItems,
+            beside: anchorWindowID
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.persistedItemReconciliationInProgress = false
+            self.finishStartupReconciliation()
+        }
+    }
+
+    private func finishStartupReconciliation() {
+        startupReconciliationComplete = true
+        model.refresh()
+        updateStorageState()
+        presentStartupShelfIfReady()
+    }
+
+    private func reconcileNewlyVisiblePersistedItems() {
+        guard
+            !persistedItemReconciliationInProgress,
+            PermissionCenter.isAccessibilityGranted,
+            let anchorWindowID = windowID(for: storageAnchor)
+        else { return }
+
+        let anchorFrame = PrivateWindowServer.frame(of: anchorWindowID)
+        let liveWindowIDs = Set(PrivateWindowServer.menuBarWindowIDs())
+        let visiblePersistedItems = model.barrItems.filter { item in
+            item.isMovableByBarr &&
+                liveWindowIDs.contains(item.windowID) &&
+                anchorFrame.map { anchor in item.frame.midX >= anchor.midX } == true
+        }
+        guard !visiblePersistedItems.isEmpty else { return }
+
+        persistedItemReconciliationInProgress = true
+        reconcile(
+            visiblePersistedItems,
+            beside: anchorWindowID
+        ) { [weak self] movedAnyItem in
+            guard let self else { return }
+            self.persistedItemReconciliationInProgress = false
+            if movedAnyItem {
+                self.model.refresh()
+            }
+        }
+    }
+
+    private func reconcile(
+        _ persistedItems: [MenuBarItem],
+        beside anchorWindowID: CGWindowID,
+        completion: @escaping (Bool) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var movedAnyItem = false
+            for persistedItem in persistedItems {
+                for attempt in 0..<2 {
+                    let scannedItems = MenuBarScanner.scan(captureImages: false)
+                    guard let currentItem = scannedItems.first(where: {
+                        $0.storageKey == persistedItem.storageKey
+                    }) else {
+                        break
+                    }
+
+                    let liveWindowIDs = Set(PrivateWindowServer.menuBarWindowIDs())
+                    guard
+                        liveWindowIDs.contains(currentItem.windowID),
+                        let anchorFrame = PrivateWindowServer.frame(of: anchorWindowID),
+                        currentItem.frame.midX >= anchorFrame.midX
+                    else {
+                        break
+                    }
+
+                    let targetPoint = CGPoint(
+                        x: anchorFrame.minX - 1,
+                        y: anchorFrame.midY
+                    )
+                    guard MenuBarMover.move(
+                        windowID: currentItem.windowID,
+                        sourcePID: currentItem.ownerPID,
+                        beside: anchorWindowID,
+                        at: targetPoint
+                    ) else {
+                        continue
+                    }
+
+                    Thread.sleep(forTimeInterval: attempt == 0 ? 0.14 : 0.22)
+                    let refreshedItem = MenuBarScanner.scan(captureImages: false).first {
+                        $0.storageKey == persistedItem.storageKey
+                    }
+                    let refreshedLiveIDs = Set(PrivateWindowServer.menuBarWindowIDs())
+                    let refreshedAnchorFrame =
+                        PrivateWindowServer.frame(of: anchorWindowID) ?? anchorFrame
+                    let isParked = refreshedItem.map {
+                        !refreshedLiveIDs.contains($0.windowID) ||
+                            $0.frame.midX < refreshedAnchorFrame.midX
+                    } ?? !refreshedLiveIDs.contains(currentItem.windowID)
+                    if isParked {
+                        movedAnyItem = true
+                        break
+                    }
+                }
+            }
+
+            DispatchQueue.main.async {
+                completion(movedAnyItem)
+            }
+        }
+    }
+
+    private func requestStartupShelf() {
+        startupShelfRequested = true
+        presentStartupShelfIfReady()
+    }
+
+    private func presentStartupShelfIfReady() {
+        guard
+            startupShelfRequested,
+            handledInitialRefresh,
+            startupReconciliationComplete || !PermissionCenter.isAccessibilityGranted
+        else { return }
+        startupShelfRequested = false
+        showShelf()
     }
 
     private func activateFromShelf(_ item: MenuBarItem) {
@@ -82,7 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         returnHiddenItemNow()
-        shelfPanel.close()
+        closeShelf()
         let revealPoint = CGPoint(x: controlFrame.minX - 1, y: controlFrame.midY)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -407,7 +614,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStatusItems() {
-        setPreferredPosition(0, autosaveName: "BarrControl")
+        // AppKit updates this preference whenever neighboring status items are
+        // reordered. That can strand Barr beneath the notch on the next launch,
+        // leaving its panel visible with no reachable control. Barr is the
+        // gateway to every parked item, so restore it to the highest visible
+        // status-item priority every time the process starts.
+        setPreferredPosition(0, autosaveName: "BarrControl", force: true)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = "BarrControl"
 #if DEBUG
@@ -543,7 +755,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleShelf() {
-        shelfPanel.isVisible ? shelfPanel.close() : showShelf()
+        shelfPanel.isVisible ? closeShelf() : showShelf()
     }
 
     private func showShelf(attempt: Int = 0) {
@@ -553,7 +765,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         refreshScannerExclusions()
         model.refresh()
-        if !shelfPanel.show(relativeTo: button) {
+        if shelfPanel.show(relativeTo: button) {
+            installShelfDismissMonitors()
+        } else {
+            removeShelfDismissMonitors()
             retryShowingShelf(after: attempt)
         }
     }
@@ -562,6 +777,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard attempt < 10 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.showShelf(attempt: attempt + 1)
+        }
+    }
+
+    private func closeShelf() {
+        shelfPanel?.close()
+        removeShelfDismissMonitors()
+    }
+
+    private func installShelfDismissMonitors() {
+        removeShelfDismissMonitors()
+        shelfGlobalDismissMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.closeShelf()
+            }
+        }
+        shelfLocalDismissMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            if event.type == .keyDown, event.keyCode == 53 {
+                self.closeShelf()
+            } else if
+                event.type != .keyDown,
+                event.window !== self.shelfPanel,
+                event.window !== self.statusItem.button?.window
+            {
+                self.closeShelf()
+            }
+            return event
+        }
+    }
+
+    private func removeShelfDismissMonitors() {
+        if let shelfGlobalDismissMonitor {
+            NSEvent.removeMonitor(shelfGlobalDismissMonitor)
+            self.shelfGlobalDismissMonitor = nil
+        }
+        if let shelfLocalDismissMonitor {
+            NSEvent.removeMonitor(shelfLocalDismissMonitor)
+            self.shelfLocalDismissMonitor = nil
         }
     }
 
@@ -579,9 +836,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func environmentChanged() {
-        shelfPanel?.close()
+        closeShelf()
         refreshScannerExclusions()
         model.refresh()
+    }
+
+    @objc private func runningApplicationsChanged() {
+        runningApplicationsGeneration += 1
+        let generation = runningApplicationsGeneration
+        for delay in [0.6, 2.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard
+                    let self,
+                    generation == self.runningApplicationsGeneration
+                else { return }
+                self.refreshScannerExclusions()
+                self.model.refresh()
+            }
+        }
     }
 
     @objc private func refresh() {

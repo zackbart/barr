@@ -15,6 +15,7 @@ final class ShelfModel: ObservableObject {
     @Published private(set) var showsSystemItems: Bool
 
     var onItemsChanged: (() -> Void)?
+    var onRefreshCompleted: (() -> Void)?
     var onActivate: ((MenuBarItem) -> Void)?
     var onRestart: (() -> Void)?
     var onMembershipChange: ((MenuBarItem, Bool, @escaping (Bool) -> Void) -> Void)?
@@ -89,6 +90,7 @@ final class ShelfModel: ObservableObject {
                 self.screenCaptureNeedsRestart = self.requestedScreenCaptureThisLaunch && !self.canCaptureScreen
                 self.isRefreshing = false
                 self.onItemsChanged?()
+                self.onRefreshCompleted?()
 #if DEBUG
                 print("[Barr] Found \(found.count) menu bar app item(s)")
 #endif

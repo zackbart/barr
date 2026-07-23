@@ -2,6 +2,18 @@
 
 All notable changes to Barr are documented here.
 
+## [0.0.4] - 2026-07-23
+
+### Fixed
+
+- Kept Barr's own menu bar control at a visible priority across quit and relaunch,
+  including on MacBooks with a notch.
+- Re-applied every persisted Barr membership after the first launch scan so
+  selected apps return to the shelf reliably after reopening Barr, regaining
+  Accessibility permission, or launching later in the session.
+- Prevented the shelf from opening beneath an unreachable status item and made
+  it dismiss when clicking elsewhere or pressing Escape.
+
 ## [0.0.3] - 2026-07-23
 
 ### Fixed
@@ -51,6 +63,7 @@ All notable changes to Barr are documented here.
 
 - Initial signed and notarized release.
 
+[0.0.4]: https://github.com/zackbart/barr/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/zackbart/barr/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/zackbart/barr/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/zackbart/barr/releases/tag/v0.0.1
