@@ -53,6 +53,7 @@ Barr is a menu-bar utility (`LSUIElement`) and does not appear in the Dock.
 ```text
 app/                  XcodeGen project, Swift sources, and app assets
 .github/workflows/    Tag-driven release automation
+CHANGELOG.md           Release history and notable changes
 README.md             Project overview
 ```
 

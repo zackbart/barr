@@ -40,7 +40,11 @@ struct ShelfView: View {
                 model.setManaging(true)
             } label: {
                 Image(systemName: "slider.horizontal.3")
-                    .frame(width: 26, height: 26)
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(
+                        width: MenuBarItem.iconHitTarget,
+                        height: MenuBarItem.iconHitTarget
+                    )
             }
             .buttonStyle(ShelfButtonStyle())
             .help("Choose menu bar apps")
@@ -61,18 +65,34 @@ struct ShelfView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     iconRow(items: model.barrItems, action: model.returnToMenuBar)
                 }
-                .frame(height: 40)
+                .frame(height: 48)
             }
 
             Divider()
                 .padding(.horizontal, 10)
 
-            laneHeader("Menu Bar", detail: "Click to move into Barr") { EmptyView() }
+            laneHeader("Menu Bar", detail: "Click to move into Barr") {
+                Toggle(
+                    "System items",
+                    isOn: Binding(
+                        get: { model.showsSystemItems },
+                        set: model.setShowsSystemItems
+                    )
+                )
+                .font(.system(size: 10))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("Include macOS system menu bar items")
+            }
 
             ScrollView(.horizontal, showsIndicators: false) {
-                iconRow(items: model.menuBarItems, action: model.moveToBarr)
+                iconRow(
+                    items: model.menuBarItems,
+                    action: model.moveToBarr,
+                    canInteract: { $0.isMovableByBarr }
+                )
             }
-            .frame(height: 40)
+            .frame(height: 48)
         }
         .padding(.vertical, 7)
     }
@@ -105,12 +125,13 @@ struct ShelfView: View {
             Spacer()
         }
         .padding(.horizontal, 12)
-        .frame(height: 40)
+        .frame(height: 48)
     }
 
     private func iconRow(
         items: [MenuBarItem],
-        action: @escaping (MenuBarItem) -> Void
+        action: @escaping (MenuBarItem) -> Void,
+        canInteract: @escaping (MenuBarItem) -> Bool = { _ in true }
     ) -> some View {
         HStack(spacing: 2) {
             ForEach(items) { item in
@@ -120,28 +141,46 @@ struct ShelfView: View {
                     Group {
                         if let symbolName = item.systemSymbolName {
                             Image(systemName: symbolName)
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.system(size: 17, weight: .medium))
                                 .foregroundStyle(.primary)
                         } else if let image = item.image {
                             Image(nsImage: image)
+                                .renderingMode(image.isTemplate ? .template : .original)
                                 .resizable()
                                 .interpolation(.high)
                                 .scaledToFit()
+                                .foregroundStyle(.primary)
                         } else {
                             Image(systemName: "app.dashed")
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .frame(width: item.logicalWidth, height: 24)
+                    .frame(
+                        width: item.renderedIconWidth,
+                        height: MenuBarItem.visualIconHeight
+                    )
+                    .frame(
+                        width: item.logicalWidth,
+                        height: MenuBarItem.iconHitTarget
+                    )
                     .contentShape(Rectangle())
                     .padding(.horizontal, 3)
-                    .padding(.vertical, 7)
-                    .opacity(model.movingItemKeys.contains(item.storageKey) ? 0.35 : 1)
+                    .padding(.vertical, 5)
+                    .opacity(
+                        model.movingItemKeys.contains(item.storageKey) || !canInteract(item)
+                            ? 0.35
+                            : 1
+                    )
                 }
                 .buttonStyle(ShelfButtonStyle())
-                .disabled(!model.movingItemKeys.isEmpty)
-                .help(item.displayName)
+                .disabled(!model.movingItemKeys.isEmpty || !canInteract(item))
+                .help(
+                    canInteract(item)
+                        ? item.displayName
+                        : "\(item.displayName) is fixed by macOS"
+                )
                 .accessibilityLabel(item.displayName)
+                .accessibilityHint(canInteract(item) ? "" : "Fixed by macOS")
             }
         }
         .padding(.horizontal, 6)

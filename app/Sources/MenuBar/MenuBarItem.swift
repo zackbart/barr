@@ -2,6 +2,9 @@ import AppKit
 import CoreGraphics
 
 struct MenuBarItem: Identifiable {
+    static let visualIconHeight: CGFloat = 24
+    static let iconHitTarget: CGFloat = 32
+
     let windowID: CGWindowID
     let ownerPID: pid_t
     let ownerName: String
@@ -12,7 +15,9 @@ struct MenuBarItem: Identifiable {
     let isOnScreen: Bool
     let image: NSImage?
 
-    var id: CGWindowID { windowID }
+    // WindowServer can replace or re-parent a status item's window while Barr
+    // moves it. Its logical identity stays stable across those transitions.
+    var id: String { storageKey }
 
     var displayName: String {
         guard let title, !title.isEmpty else { return ownerName }
@@ -29,11 +34,28 @@ struct MenuBarItem: Identifiable {
         [bundleIdentifier ?? ownerName, title ?? ownerName].joined(separator: "|")
     }
 
-    var systemSymbolName: String? {
-        guard
-            bundleIdentifier == "com.apple.controlcenter" ||
+    var isSystemItem: Bool {
+        bundleIdentifier == "com.apple.controlcenter" ||
             bundleIdentifier == "com.apple.systemuiserver"
-        else { return nil }
+    }
+
+    var isMovableByBarr: Bool {
+        guard isSystemItem else { return true }
+        let identity = [stableIdentifier, title]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+
+        // These are permanent macOS menu-bar surfaces rather than movable
+        // status items. In particular, the clock owns Notification Center and
+        // Apple documents that it is always present.
+        return !identity.contains("control center") &&
+            !identity.contains("clock") &&
+            !identity.contains("audio and video controls")
+    }
+
+    var systemSymbolName: String? {
+        guard isSystemItem else { return nil }
 
         let identity = [stableIdentifier, title]
             .compactMap { $0 }
@@ -64,7 +86,29 @@ struct MenuBarItem: Identifiable {
         return nil
     }
 
+    var renderedIconWidth: CGFloat {
+        guard systemSymbolName == nil, let image, image.size.height > 0 else {
+            return Self.visualIconHeight
+        }
+        let aspectRatio = min(max(image.size.width / image.size.height, 0.7), 2.6)
+        return min(max(Self.visualIconHeight * aspectRatio, 18), 58)
+    }
+
     var logicalWidth: CGFloat {
-        min(max(frame.width, 24), 52)
+        max(renderedIconWidth, Self.iconHitTarget)
+    }
+
+    func replacingImage(_ image: NSImage) -> MenuBarItem {
+        MenuBarItem(
+            windowID: windowID,
+            ownerPID: ownerPID,
+            ownerName: ownerName,
+            bundleIdentifier: bundleIdentifier,
+            title: title,
+            stableIdentifier: stableIdentifier,
+            frame: frame,
+            isOnScreen: isOnScreen,
+            image: image
+        )
     }
 }

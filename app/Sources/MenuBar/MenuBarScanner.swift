@@ -26,6 +26,10 @@ enum MenuBarScanner {
         let sources = accessibilitySources().filter {
             $0.frame.width > 0 && $0.frame.height > 0
         }
+        let activeSourceKeys = Set(sources.map(\.sourceKey))
+        windowIDBySourceKey = windowIDBySourceKey.filter {
+            activeSourceKeys.contains($0.key)
+        }
         var claimedWindowIDs = Set<CGWindowID>()
         var items = [MenuBarItem]()
 
@@ -42,7 +46,12 @@ enum MenuBarScanner {
                 // once Barr parks them beyond the screen edge. Their IDs and
                 // private frames remain valid, so keep using that exact window
                 // instead of relabelling a visible neighbor with similar geometry.
-                return available.first { $0.windowID == previousID } ?? rawWindow(previousID)
+                let candidate = available.first { $0.windowID == previousID } ?? rawWindow(previousID)
+                guard let candidate, matchCost(candidate.frame, source.frame) <= 320 else {
+                    windowIDBySourceKey.removeValue(forKey: source.sourceKey)
+                    return nil
+                }
+                return candidate
             }
             let geometricMatch = available
                 .map { ($0, matchCost($0.frame, source.frame)) }
@@ -141,7 +150,7 @@ enum MenuBarScanner {
             stableIdentifier: source.stableIdentifier,
             frame: window.frame,
             isOnScreen: window.isOnScreen,
-            image: captureImages ? capture(windowID: window.windowID) : nil
+            image: captureImages ? capture(windowID: window.windowID, source: source) : nil
         )
     }
 
@@ -245,15 +254,48 @@ enum MenuBarScanner {
         return horizontalDistance + verticalDistance * 4 + widthDifference * 2
     }
 
-    private static func capture(windowID: CGWindowID) -> NSImage? {
-        var rawWindow = UnsafeRawPointer(bitPattern: UInt(windowID))
-        guard
-            let array = CFArrayCreate(kCFAllocatorDefault, &rawWindow, 1, nil),
-            let image = CGImage.captureWindowList(array)
-        else {
-            return nil
+    private static func capture(
+        windowID: CGWindowID,
+        source: AccessibilitySource
+    ) -> NSImage? {
+        if #available(macOS 26, *) {
+            return owningApplicationIcon(for: source)
         }
-        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+
+        var rawWindow = UnsafeRawPointer(bitPattern: UInt(windowID))
+        if
+            let array = CFArrayCreate(kCFAllocatorDefault, &rawWindow, 1, nil),
+            let image = CGImage.captureWindowList(array),
+            hasVisiblePixels(image)
+        {
+            let frameSize = PrivateWindowServer.frame(of: windowID)?.size ?? .zero
+            let pointSize = frameSize.width > 0 && frameSize.height > 0
+                ? frameSize
+                : NSSize(width: image.width, height: image.height)
+            return NSImage(cgImage: image, size: pointSize)
+        }
+
+        // A failed or redacted capture should never become an empty hit target.
+        return owningApplicationIcon(for: source)
+    }
+
+    private static func owningApplicationIcon(for source: AccessibilitySource) -> NSImage? {
+        NSRunningApplication(processIdentifier: source.ownerPID)?.icon?.copy() as? NSImage
+    }
+
+    private static func hasVisiblePixels(_ image: CGImage) -> Bool {
+        let bitmap = NSBitmapImageRep(cgImage: image)
+        let xStep = max(1, image.width / 16)
+        let yStep = max(1, image.height / 16)
+
+        for y in stride(from: 0, to: image.height, by: yStep) {
+            for x in stride(from: 0, to: image.width, by: xStep) {
+                if bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0 > 0.05 {
+                    return true
+                }
+            }
+        }
+        return false
     }
 }
 

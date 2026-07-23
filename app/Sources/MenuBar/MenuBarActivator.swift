@@ -14,6 +14,20 @@ enum MenuBarActivator {
         }
 
         let elements = descendants(of: extrasMenu, maximumDepth: 4)
+        let identityMatch = elements
+            .compactMap { element -> (AXUIElement, Int)? in
+                identityScore(for: element, item: item).map { (element, $0) }
+            }
+            .min { $0.1 < $1.1 }?
+            .0
+
+        if
+            let identityMatch,
+            AXUIElementPerformAction(identityMatch, kAXPressAction as CFString) == .success
+        {
+            return true
+        }
+
         let matching = elements
             .compactMap { element -> (AXUIElement, CGFloat)? in
                 guard let frame = frame(of: element) else { return nil }
@@ -29,6 +43,52 @@ enum MenuBarActivator {
             return true
         }
         return fallbackClick(item)
+    }
+
+    private static func identityScore(for element: AXUIElement, item: MenuBarItem) -> Int? {
+        let stableIdentifier = item.stableIdentifier?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let identifier = stringAttribute(element, kAXIdentifierAttribute as CFString)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if
+            let stableIdentifier,
+            !stableIdentifier.isEmpty,
+            identifier?.localizedCaseInsensitiveCompare(stableIdentifier) == .orderedSame
+        {
+            return 0
+        }
+
+        let labels = [
+            kAXTitleAttribute,
+            kAXDescriptionAttribute,
+            kAXHelpAttribute
+        ]
+        .compactMap { stringAttribute(element, $0 as CFString) }
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+
+        let identities = [stableIdentifier, item.title]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if labels.contains(where: { label in
+            identities.contains {
+                label.localizedCaseInsensitiveCompare($0) == .orderedSame
+            }
+        }) {
+            return 1
+        }
+
+        if labels.contains(where: { label in
+            identities.contains {
+                label.localizedCaseInsensitiveContains($0) ||
+                $0.localizedCaseInsensitiveContains(label)
+            }
+        }) {
+            return 2
+        }
+        return nil
     }
 
     private static func fallbackClick(_ item: MenuBarItem) -> Bool {
@@ -87,5 +147,13 @@ enum MenuBarActivator {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
         return value as! AXValue?
+    }
+
+    private static func stringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        return value as? String
     }
 }

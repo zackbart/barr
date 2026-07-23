@@ -29,14 +29,18 @@ final class ShelfPanel: NSPanel {
         contentView = hostingView
     }
 
-    func show(relativeTo button: NSStatusBarButton) {
+    @discardableResult
+    func show(relativeTo button: NSStatusBarButton) -> Bool {
         resizeToFit()
-        guard let buttonWindow = button.window, let screen = buttonWindow.screen ?? NSScreen.main else { return }
+        guard let buttonWindow = button.window, let screen = buttonWindow.screen ?? NSScreen.main else {
+            return false
+        }
         let buttonFrame = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
         let x = min(max(screen.visibleFrame.minX + 8, buttonFrame.midX - frame.width / 2), screen.visibleFrame.maxX - frame.width - 8)
         let y = buttonFrame.minY - frame.height - 5
         setFrameOrigin(NSPoint(x: x, y: y))
         orderFrontRegardless()
+        return true
     }
 
     func resizeToFit() {
@@ -49,13 +53,13 @@ final class ShelfPanel: NSPanel {
             desiredHeight = 174
         } else if model.isManaging {
             desiredWidth = 520
-            desiredHeight = 154
+            desiredHeight = 170
         } else if model.barrItems.isEmpty {
             desiredWidth = 310
             desiredHeight = 74
         } else {
             desiredWidth = model.barrItems.reduce(62) { $0 + $1.logicalWidth + 8 }
-            desiredHeight = 58
+            desiredHeight = 66
         }
 
         setContentSize(NSSize(width: min(desiredWidth, screenWidth), height: desiredHeight))

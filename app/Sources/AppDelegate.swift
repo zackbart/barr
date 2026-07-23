@@ -1,5 +1,15 @@
 import AppKit
 import ApplicationServices
+import OSLog
+
+private let barrMembershipLogger = Logger(
+    subsystem: "com.cursorkittens.Barr",
+    category: "Membership"
+)
+private let barrActivationLogger = Logger(
+    subsystem: "com.cursorkittens.Barr",
+    category: "Activation"
+)
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -91,6 +101,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.storageKey == item.storageKey
                 } ?? currentItem
                 let activated = moved && MenuBarActivator.activate(revealedItem)
+#if DEBUG
+                barrActivationLogger.notice(
+                    """
+                    Activation target=\(item.storageKey, privacy: .public) \
+                    moved=\(moved) activated=\(activated) \
+                    revealedWindow=\(revealedItem.windowID)
+                    """
+                )
+#endif
                 self.model.activationFailed = !activated
                 guard moved else {
                     self.showShelf()
@@ -220,35 +239,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 for: item,
                 moveToBarr: moveToBarr
             ) else {
+#if DEBUG
+                barrMembershipLogger.notice(
+                    "Move has no anchor target=\(item.storageKey, privacy: .public)"
+                )
+#endif
                 completion(false)
                 self.updateStorageState()
                 return
             }
 
+#if DEBUG
+            barrMembershipLogger.notice(
+                """
+                Move start direction=\(moveToBarr ? "into-barr" : "to-menu-bar", privacy: .public) \
+                target=\(item.storageKey, privacy: .public) window=\(item.windowID) \
+                anchor=\(anchorWindowID) frame=\(NSStringFromRect(anchorFrame), privacy: .public)
+                """
+            )
+#endif
             let targetPoint = CGPoint(x: anchorFrame.minX - 1, y: anchorFrame.midY)
             DispatchQueue.global(qos: .userInitiated).async {
+                let baselineItems = MenuBarScanner.scan(captureImages: false)
+                let baselineSystemKeys = Set(
+                    baselineItems
+                        .filter { $0.isSystemItem && $0.storageKey != item.storageKey }
+                        .map(\.storageKey)
+                )
                 var moved = false
+                var lastScan = baselineItems
                 for attempt in 0..<2 where !moved {
-                    let currentItem = MenuBarScanner.scan(captureImages: false).first {
+                    let currentItem = lastScan.first {
                         $0.storageKey == item.storageKey
-                    } ?? item
+                    } ?? (attempt == 0 ? item : nil)
+                    guard let currentItem else { break }
+
+#if DEBUG
+                    barrMembershipLogger.notice(
+                        """
+                        Move attempt=\(attempt) target=\(currentItem.storageKey, privacy: .public) \
+                        window=\(currentItem.windowID) sourceFrame=\(NSStringFromRect(currentItem.frame), privacy: .public) \
+                        targetPoint=\(NSStringFromPoint(targetPoint), privacy: .public)
+                        """
+                    )
+#endif
                     let attempted = MenuBarMover.move(
                         windowID: currentItem.windowID,
                         sourcePID: currentItem.ownerPID,
                         beside: anchorWindowID,
                         at: targetPoint
                     )
-                    Thread.sleep(forTimeInterval: attempt == 0 ? 0.12 : 0.18)
-                    let movedItem = MenuBarScanner.scan(captureImages: false).first {
-                        $0.storageKey == item.storageKey
+                    guard attempted else { continue }
+
+                    var targetWasObserved = false
+                    for delay in [0.08, 0.14, 0.22] where !moved {
+                        Thread.sleep(forTimeInterval: delay)
+                        lastScan = MenuBarScanner.scan(captureImages: false)
+                        let liveMenuBarWindowIDs = Set(PrivateWindowServer.menuBarWindowIDs())
+                        let verificationAnchorFrame =
+                            PrivateWindowServer.frame(of: anchorWindowID) ?? anchorFrame
+                        let movedItem = lastScan.first {
+                            $0.storageKey == item.storageKey
+                        }
+#if DEBUG
+                        barrMembershipLogger.notice(
+                            """
+                            Move poll delay=\(delay) targetSeen=\(movedItem != nil) \
+                            observedWindow=\(movedItem?.windowID ?? 0) \
+                            observedFrame=\(movedItem.map { NSStringFromRect($0.frame) } ?? "none", privacy: .public) \
+                            observedLive=\(movedItem.map { liveMenuBarWindowIDs.contains($0.windowID) } ?? false) \
+                            sourceLive=\(liveMenuBarWindowIDs.contains(currentItem.windowID)) \
+                            liveAnchorFrame=\(NSStringFromRect(verificationAnchorFrame), privacy: .public)
+                            """
+                        )
+#endif
+                        targetWasObserved = targetWasObserved || movedItem != nil
+                        moved = moveToBarr
+                            ? movedItem.map {
+                                !liveMenuBarWindowIDs.contains($0.windowID) ||
+                                    $0.frame.midX < verificationAnchorFrame.midX
+                            } ?? !liveMenuBarWindowIDs.contains(currentItem.windowID)
+                            : movedItem.map {
+                                liveMenuBarWindowIDs.contains($0.windowID)
+                            } == true
                     }
-                    let liveMenuBarWindowIDs = Set(PrivateWindowServer.menuBarWindowIDs())
-                    moved = attempted && movedItem.map {
-                        moveToBarr
-                            ? !liveMenuBarWindowIDs.contains($0.windowID) || $0.frame.midX < anchorFrame.midX
-                            : liveMenuBarWindowIDs.contains($0.windowID)
-                    } == true
+
+                    // If the scanner lost the target entirely, another drag
+                    // could act on a stale/reused window ID and disturb a
+                    // neighboring system item. Let a later refresh reconcile it.
+                    if !targetWasObserved && !moved {
+                        break
+                    }
                 }
+
+#if DEBUG
+                barrMembershipLogger.notice(
+                    """
+                    Move result target=\(item.storageKey, privacy: .public) \
+                    success=\(moved) observedItems=\(lastScan.count)
+                    """
+                )
+                if moved && !baselineSystemKeys.isEmpty {
+                    let presentKeys = Set(
+                        MenuBarScanner.scan(captureImages: false).map(\.storageKey)
+                    )
+                    let missingKeys = baselineSystemKeys.subtracting(presentKeys)
+                    if !missingKeys.isEmpty {
+                        print("[Barr] System items missing after move: \(missingKeys.sorted())")
+                    }
+                }
+#endif
 
                 DispatchQueue.main.async {
                     completion(moved)
@@ -262,10 +362,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard storageAnchor != nil else { return }
         storageUpdateGeneration += 1
         let generation = storageUpdateGeneration
+        let keepShelfOpen = shelfPanel?.isVisible == true
 
         guard !model.movedItemKeys.isEmpty, !model.barrItems.isEmpty else {
             storageAnchor.length = collapsedStorageLength
             refreshScannerExclusions()
+            repositionShelfIfNeeded(keepOpen: keepShelfOpen)
             return
         }
 
@@ -290,23 +392,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 self.refreshScannerExclusions()
+                self.repositionShelfIfNeeded(keepOpen: keepShelfOpen)
             }
         }
+    }
+
+    private func repositionShelfIfNeeded(keepOpen: Bool) {
+        guard keepOpen, let button = statusItem.button else { return }
+        shelfPanel.show(relativeTo: button)
     }
 
     private func configureStatusItems() {
         setPreferredPosition(0, autosaveName: "BarrControl")
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = "BarrControl"
+#if DEBUG
+        statusItem.button?.image = NSImage(
+            systemSymbolName: "ladybug.fill",
+            accessibilityDescription: "Barr debug build"
+        )
+        statusItem.button?.title = " DEBUG"
+        statusItem.button?.imagePosition = .imageLeading
+        statusItem.button?.font = .systemFont(ofSize: 10, weight: .bold)
+        statusItem.button?.toolTip = "Barr — Debug Build"
+#else
         statusItem.button?.image = NSImage(
             systemSymbolName: "line.3.horizontal",
             accessibilityDescription: "Barr overflow shelf"
         )
+        statusItem.button?.toolTip = "Barr"
+#endif
         statusItem.button?.image?.isTemplate = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusItemPressed(_:))
         statusItem.button?.sendAction(on: [.leftMouseDown, .rightMouseUp])
-        statusItem.button?.toolTip = "Barr"
 
         // A far-left parking boundary. It remains zero-width until at least one
         // explicitly selected item has been moved to its left.
@@ -337,20 +456,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if
             let neighbor = model.returnAnchor(for: item),
+            PrivateWindowServer.menuBarWindowIDs().contains(neighbor.windowID),
             let frame = PrivateWindowServer.frame(of: neighbor.windowID)
         {
             return (neighbor.windowID, frame)
         }
 
         if
-            let windowID = windowID(for: storageAnchor),
+            let windowID = windowID(for: statusItem),
             let frame = PrivateWindowServer.frame(of: windowID)
         {
             return (windowID, frame)
         }
 
         guard
-            let windowID = windowID(for: statusItem),
+            let windowID = windowID(for: storageAnchor),
             let frame = PrivateWindowServer.frame(of: windowID)
         else { return nil }
         return (windowID, frame)
@@ -422,11 +542,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shelfPanel.isVisible ? shelfPanel.close() : showShelf()
     }
 
-    private func showShelf() {
-        guard let button = statusItem.button else { return }
+    private func showShelf(attempt: Int = 0) {
+        guard let button = statusItem.button, button.window != nil else {
+            retryShowingShelf(after: attempt)
+            return
+        }
         refreshScannerExclusions()
         model.refresh()
-        shelfPanel.show(relativeTo: button)
+        if !shelfPanel.show(relativeTo: button) {
+            retryShowingShelf(after: attempt)
+        }
+    }
+
+    private func retryShowingShelf(after attempt: Int) {
+        guard attempt < 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.showShelf(attempt: attempt + 1)
+        }
     }
 
     private func showContextMenu() {

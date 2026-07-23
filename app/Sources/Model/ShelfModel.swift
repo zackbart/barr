@@ -5,13 +5,14 @@ import Combine
 final class ShelfModel: ObservableObject {
     @Published private(set) var items: [MenuBarItem] = []
     @Published private(set) var movedItemKeys: Set<String>
-    @Published private(set) var movingItemKeys: Set<String> = []
+    @Published private var pendingMembershipChange: PendingMembershipChange?
     @Published var isManaging = false
     @Published private(set) var isRefreshing = false
     @Published private(set) var canCaptureScreen = PermissionCenter.canCaptureScreen
     @Published private(set) var canUseAccessibility = PermissionCenter.isAccessibilityGranted
     @Published private(set) var screenCaptureNeedsRestart = false
     @Published var activationFailed = false
+    @Published private(set) var showsSystemItems: Bool
 
     var onItemsChanged: (() -> Void)?
     var onActivate: ((MenuBarItem) -> Void)?
@@ -22,9 +23,15 @@ final class ShelfModel: ObservableObject {
     private var requestedScreenCaptureThisLaunch = false
     private var itemOrder: [String]
 
+    private struct PendingMembershipChange {
+        let itemKey: String
+        let moveToBarr: Bool
+    }
+
     init() {
         movedItemKeys = Set(UserDefaults.standard.stringArray(forKey: "BarrMovedItemKeys") ?? [])
         itemOrder = UserDefaults.standard.stringArray(forKey: "BarrItemOrder") ?? []
+        showsSystemItems = UserDefaults.standard.bool(forKey: "BarrShowsSystemItems")
         permissionPoller = Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -33,11 +40,19 @@ final class ShelfModel: ObservableObject {
     }
 
     var barrItems: [MenuBarItem] {
-        ordered(items.filter { movedItemKeys.contains($0.storageKey) })
+        ordered(items.filter { isInBarr($0.storageKey) })
     }
 
     var menuBarItems: [MenuBarItem] {
-        ordered(items.filter { !movedItemKeys.contains($0.storageKey) })
+        ordered(
+            items.filter {
+                !isInBarr($0.storageKey) && (showsSystemItems || !$0.isSystemItem)
+            }
+        )
+    }
+
+    var movingItemKeys: Set<String> {
+        pendingMembershipChange.map { [$0.itemKey] } ?? []
     }
 
     func refresh() {
@@ -53,9 +68,19 @@ final class ShelfModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, generation == self.refreshGeneration else { return }
                 self.migrateLegacyKeys(using: found)
-                self.items = found
-                self.mergeItemOrder(found)
-                self.canCaptureScreen = PermissionCenter.canCaptureScreen || found.contains { $0.image != nil }
+                let existingItems = Dictionary(
+                    self.items.map { ($0.storageKey, $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                let stableItems = found.map { item in
+                    guard item.image == nil, let previousImage = existingItems[item.storageKey]?.image else {
+                        return item
+                    }
+                    return item.replacingImage(previousImage)
+                }
+                self.items = stableItems
+                self.mergeItemOrder(stableItems)
+                self.canCaptureScreen = PermissionCenter.canCaptureScreen
                 self.canUseAccessibility = PermissionCenter.isAccessibilityGranted
                 self.screenCaptureNeedsRestart = self.requestedScreenCaptureThisLaunch && !self.canCaptureScreen
                 self.isRefreshing = false
@@ -77,6 +102,7 @@ final class ShelfModel: ObservableObject {
     }
 
     func moveToBarr(_ item: MenuBarItem) {
+        guard item.isMovableByBarr else { return }
         changeMembership(of: item, moveToBarr: true)
     }
 
@@ -86,6 +112,12 @@ final class ShelfModel: ObservableObject {
 
     func setManaging(_ managing: Bool) {
         isManaging = managing
+        onItemsChanged?()
+    }
+
+    func setShowsSystemItems(_ showsSystemItems: Bool) {
+        self.showsSystemItems = showsSystemItems
+        UserDefaults.standard.set(showsSystemItems, forKey: "BarrShowsSystemItems")
         onItemsChanged?()
     }
 
@@ -103,12 +135,15 @@ final class ShelfModel: ObservableObject {
     }
 
     private func changeMembership(of item: MenuBarItem, moveToBarr: Bool) {
-        guard movingItemKeys.isEmpty else { return }
-        movingItemKeys.insert(item.storageKey)
+        guard pendingMembershipChange == nil, let onMembershipChange else { return }
+        pendingMembershipChange = PendingMembershipChange(
+            itemKey: item.storageKey,
+            moveToBarr: moveToBarr
+        )
+        onItemsChanged?()
 
-        onMembershipChange?(item, moveToBarr) { [weak self] success in
+        onMembershipChange(item, moveToBarr) { [weak self] success in
             guard let self else { return }
-            self.movingItemKeys.remove(item.storageKey)
             if success {
                 if moveToBarr {
                     self.movedItemKeys.insert(item.storageKey)
@@ -117,8 +152,16 @@ final class ShelfModel: ObservableObject {
                 }
                 UserDefaults.standard.set(self.movedItemKeys.sorted(), forKey: "BarrMovedItemKeys")
             }
+            self.pendingMembershipChange = nil
             self.onItemsChanged?()
         }
+    }
+
+    private func isInBarr(_ itemKey: String) -> Bool {
+        if pendingMembershipChange?.itemKey == itemKey {
+            return pendingMembershipChange?.moveToBarr == true
+        }
+        return movedItemKeys.contains(itemKey)
     }
 
     private func ordered(_ source: [MenuBarItem]) -> [MenuBarItem] {
@@ -136,8 +179,27 @@ final class ShelfModel: ObservableObject {
     private func mergeItemOrder(_ found: [MenuBarItem]) {
         var known = Set(itemOrder)
         var changed = false
-        for item in found where known.insert(item.storageKey).inserted {
-            itemOrder.append(item.storageKey)
+        let foundKeys = found.reduce(into: [String]()) { result, item in
+            if !result.contains(item.storageKey) {
+                result.append(item.storageKey)
+            }
+        }
+
+        for (foundIndex, key) in foundKeys.enumerated() where known.insert(key).inserted {
+            let precedingKey = foundKeys[..<foundIndex].reversed().first {
+                itemOrder.contains($0)
+            }
+            let followingKey = foundKeys[(foundIndex + 1)...].first {
+                itemOrder.contains($0)
+            }
+
+            if let precedingKey, let orderIndex = itemOrder.firstIndex(of: precedingKey) {
+                itemOrder.insert(key, at: orderIndex + 1)
+            } else if let followingKey, let orderIndex = itemOrder.firstIndex(of: followingKey) {
+                itemOrder.insert(key, at: orderIndex)
+            } else {
+                itemOrder.append(key)
+            }
             changed = true
         }
         if changed {

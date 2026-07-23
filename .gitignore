@@ -5,6 +5,7 @@ app/Barr.xcodeproj/
 build/
 DerivedData/
 app/build/
+app/.build/
 app/DerivedData/
 *.dmg
 *.app
