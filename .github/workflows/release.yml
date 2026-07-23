@@ -107,6 +107,12 @@ jobs:
             "$DMG" "$RUNNER_TEMP/export/Barr.app"
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
 
+      - name: Sign DMG
+        run: |
+          codesign --force --sign "Developer ID Application" --timestamp \
+            "${{ steps.dmg.outputs.path }}"
+          codesign --verify --verbose=2 "${{ steps.dmg.outputs.path }}"
+
       - name: Notarize & staple
         env:
           AC_API_KEY_BASE64: ${{ secrets.AC_API_KEY_BASE64 }}
