@@ -38,7 +38,14 @@ on your Mac.
 
 ## Install
 
-Grab the latest `Barr.dmg` from [Releases](https://github.com/zackbart/barr/releases/latest).
+Install with Homebrew:
+
+```bash
+brew tap zackbart/tap
+brew install --cask barr
+```
+
+Or grab the latest `Barr.dmg` from [Releases](https://github.com/zackbart/barr/releases/latest).
 Barr is a menu-bar utility (`LSUIElement`) and does not appear in the Dock.
 
 ## Repo layout
