@@ -13,6 +13,7 @@ enum MenuBarMover {
         at targetPoint: CGPoint
     ) -> Bool {
         guard let source = CGEventSource(stateID: .combinedSessionState) else { return false }
+        let originalCursorPosition = CGEvent(source: nil)?.location
         let permitted: CGEventFilterMask = [
             .permitLocalMouseEvents,
             .permitLocalKeyboardEvents,
@@ -42,7 +43,12 @@ enum MenuBarMover {
         else { return false }
 
         CGDisplayHideCursor(CGMainDisplayID())
-        defer { CGDisplayShowCursor(CGMainDisplayID()) }
+        defer {
+            if let originalCursorPosition {
+                CGWarpMouseCursorPosition(originalCursorPosition)
+            }
+            CGDisplayShowCursor(CGMainDisplayID())
+        }
         down.post(tap: .cghidEventTap)
         Thread.sleep(forTimeInterval: 0.08)
         up.post(tap: .cghidEventTap)
@@ -58,6 +64,7 @@ enum MenuBarMover {
         ) {
             safetyUp.post(tap: .cghidEventTap)
         }
+        Thread.sleep(forTimeInterval: 0.02)
         return true
     }
 

@@ -10,10 +10,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var returnMonitor: Any?
     private var returnFallback: DispatchWorkItem?
     private var pendingReturn: (() -> Void)?
+    private var storageUpdateGeneration = 0
     private let collapsedStorageLength: CGFloat = 2
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItems()
+        refreshScannerExclusions()
         shelfPanel = ShelfPanel(model: model)
         model.onItemsChanged = { [weak self] in
             self?.shelfPanel.resizeToFit()
@@ -42,10 +44,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        model.refresh()
-
         if model.movedItemKeys.isEmpty {
             model.setManaging(true)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.refreshScannerExclusions()
+            self?.model.refresh()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
             self?.showShelf()
@@ -61,8 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func activateFromShelf(_ item: MenuBarItem) {
         guard
             let controlWindowID = windowID(for: statusItem),
-            let controlFrame = PrivateWindowServer.frame(of: controlWindowID),
-            let returnDestination = returnDestination(for: item)
+            let controlFrame = PrivateWindowServer.frame(of: controlWindowID)
         else {
             model.activationFailed = !MenuBarActivator.activate(item)
             return
@@ -73,57 +76,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let revealPoint = CGPoint(x: controlFrame.minX - 1, y: controlFrame.midY)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let currentItem = MenuBarScanner.scan(captureImages: false).first {
+                $0.storageKey == item.storageKey
+            } ?? item
             let moved = MenuBarMover.move(
-                windowID: item.windowID,
-                sourcePID: item.ownerPID,
+                windowID: currentItem.windowID,
+                sourcePID: currentItem.ownerPID,
                 beside: controlWindowID,
                 at: revealPoint
             )
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
                 guard let self else { return }
-                let currentItem = MenuBarScanner.item(windowID: item.windowID) ?? item
-                let activated = moved && MenuBarActivator.activate(currentItem)
+                let revealedItem = MenuBarScanner.scan(captureImages: false).first {
+                    $0.storageKey == item.storageKey
+                } ?? currentItem
+                let activated = moved && MenuBarActivator.activate(revealedItem)
                 self.model.activationFailed = !activated
-                guard moved else { return }
-                self.armReturn(
-                    item: item,
-                    anchorWindowID: returnDestination.windowID,
-                    returnPoint: returnDestination.point
-                )
+                guard moved else {
+                    self.showShelf()
+                    return
+                }
+                if activated {
+                    self.armReturn(item: item)
+                } else {
+                    self.parkItem(item)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        self.showShelf()
+                    }
+                }
             }
         }
     }
 
-    private func returnDestination(for item: MenuBarItem) -> (windowID: CGWindowID, point: CGPoint)? {
-        PrivateWindowServer.menuBarWindowIDs()
-            .filter { $0 != item.windowID }
-            .compactMap { windowID -> (windowID: CGWindowID, frame: CGRect)? in
-                guard let frame = PrivateWindowServer.frame(of: windowID) else { return nil }
-                return (windowID, frame)
-            }
-            .filter { $0.frame.midX > item.frame.midX }
-            .min { $0.frame.midX < $1.frame.midX }
-            .map { destination in
-                (
-                    windowID: destination.windowID,
-                    point: CGPoint(x: destination.frame.minX - 1, y: destination.frame.midY)
-                )
-            }
-    }
+    private func armReturn(item: MenuBarItem) {
+        pendingReturn = { [weak self] in self?.parkItem(item) }
 
-    private func armReturn(item: MenuBarItem, anchorWindowID: CGWindowID, returnPoint: CGPoint) {
-        pendingReturn = {
-            DispatchQueue.global(qos: .utility).async {
-                _ = MenuBarMover.move(
-                    windowID: item.windowID,
-                    sourcePID: item.ownerPID,
-                    beside: anchorWindowID,
-                    at: returnPoint
-                )
-            }
-        }
-
-        returnMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+        returnMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+        ) { [weak self] _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                 self?.returnHiddenItemNow()
             }
@@ -131,7 +121,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let fallback = DispatchWorkItem { [weak self] in self?.returnHiddenItemNow() }
         returnFallback = fallback
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: fallback)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: fallback)
+    }
+
+    private func parkItem(_ originalItem: MenuBarItem, attempt: Int = 0) {
+        guard
+            let anchorWindowID = windowID(for: storageAnchor),
+            let anchorFrame = PrivateWindowServer.frame(of: anchorWindowID)
+        else {
+            retryParking(originalItem, attempt: attempt)
+            return
+        }
+
+        let targetPoint = CGPoint(x: anchorFrame.minX - 1, y: anchorFrame.midY)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let currentItem = MenuBarScanner.scan(captureImages: false).first {
+                $0.storageKey == originalItem.storageKey
+            } ?? originalItem
+            let attempted = MenuBarMover.move(
+                windowID: currentItem.windowID,
+                sourcePID: currentItem.ownerPID,
+                beside: anchorWindowID,
+                at: targetPoint
+            )
+            Thread.sleep(forTimeInterval: 0.12)
+            let parked = attempted && MenuBarScanner.scan(captureImages: false).first {
+                $0.storageKey == originalItem.storageKey
+            }.map { $0.frame.midX < anchorFrame.midX } == true
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if parked {
+                    self.updateStorageState()
+                    self.model.refresh()
+                } else {
+                    self.retryParking(originalItem, attempt: attempt)
+                }
+            }
+        }
+    }
+
+    private func retryParking(_ item: MenuBarItem, attempt: Int) {
+        guard attempt < 2 else {
+            model.refresh()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.parkItem(item, attempt: attempt + 1)
+        }
     }
 
     private func returnHiddenItemNow() {
@@ -176,14 +213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        storageAnchor.length = collapsedStorageLength
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             guard let self else { return }
-            let anchorItem = moveToBarr ? self.storageAnchor : self.statusItem
-            guard
-                let anchorWindowID = self.windowID(for: anchorItem),
-                let anchorFrame = PrivateWindowServer.frame(of: anchorWindowID)
-            else {
+            self.refreshScannerExclusions()
+            guard let (anchorWindowID, anchorFrame) = self.membershipAnchor(
+                for: item,
+                moveToBarr: moveToBarr
+            ) else {
                 completion(false)
                 self.updateStorageState()
                 return
@@ -191,15 +227,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let targetPoint = CGPoint(x: anchorFrame.minX - 1, y: anchorFrame.midY)
             DispatchQueue.global(qos: .userInitiated).async {
-                let moved = MenuBarMover.move(
-                    windowID: item.windowID,
-                    sourcePID: item.ownerPID,
-                    beside: anchorWindowID,
-                    at: targetPoint
-                )
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+                var moved = false
+                for attempt in 0..<2 where !moved {
+                    let currentItem = MenuBarScanner.scan(captureImages: false).first {
+                        $0.storageKey == item.storageKey
+                    } ?? item
+                    let attempted = MenuBarMover.move(
+                        windowID: currentItem.windowID,
+                        sourcePID: currentItem.ownerPID,
+                        beside: anchorWindowID,
+                        at: targetPoint
+                    )
+                    Thread.sleep(forTimeInterval: attempt == 0 ? 0.12 : 0.18)
+                    let movedItem = MenuBarScanner.scan(captureImages: false).first {
+                        $0.storageKey == item.storageKey
+                    }
+                    let liveMenuBarWindowIDs = Set(PrivateWindowServer.menuBarWindowIDs())
+                    moved = attempted && movedItem.map {
+                        moveToBarr
+                            ? !liveMenuBarWindowIDs.contains($0.windowID) || $0.frame.midX < anchorFrame.midX
+                            : liveMenuBarWindowIDs.contains($0.windowID)
+                    } == true
+                }
+
+                DispatchQueue.main.async {
                     completion(moved)
-                    self.updateStorageState()
                     self.model.refresh()
                 }
             }
@@ -208,24 +260,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStorageState() {
         guard storageAnchor != nil else { return }
-        guard !model.barrItems.isEmpty else {
+        storageUpdateGeneration += 1
+        let generation = storageUpdateGeneration
+
+        guard !model.movedItemKeys.isEmpty, !model.barrItems.isEmpty else {
             storageAnchor.length = collapsedStorageLength
+            refreshScannerExclusions()
             return
         }
 
-        // Never expand the parking lane if it could affect an unselected icon.
-        storageAnchor.length = collapsedStorageLength
-        DispatchQueue.main.async { [weak self] in
+        // The anchor's right edge stays fixed as its width changes. Extending it
+        // from that edge to just beyond the screen's left edge parks every item
+        // on its left without measuring, collapsing, or reshuffling the lane.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
             guard
                 let self,
                 let windowID = self.windowID(for: self.storageAnchor),
-                let anchorFrame = PrivateWindowServer.frame(of: windowID)
+                let anchorFrame = PrivateWindowServer.frame(of: windowID),
+                let screen = self.storageAnchor.button?.window?.screen ?? NSScreen.main
             else { return }
 
-            let everyMenuBarItemIsSafe = self.model.menuBarItems.allSatisfy {
-                $0.frame.midX > anchorFrame.midX
+            guard generation == self.storageUpdateGeneration else { return }
+            let desiredLength = min(
+                max(self.collapsedStorageLength, anchorFrame.maxX - screen.frame.minX + 8),
+                screen.frame.width + 8
+            )
+            if abs(self.storageAnchor.length - desiredLength) > 1 {
+                self.storageAnchor.length = desiredLength
             }
-            self.storageAnchor.length = everyMenuBarItemIsSafe ? 10_000 : self.collapsedStorageLength
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self.refreshScannerExclusions()
+            }
         }
     }
 
@@ -248,9 +313,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setPreferredPosition(1_000_000_000, autosaveName: "BarrStorageAnchor", force: true)
         storageAnchor = NSStatusBar.system.statusItem(withLength: collapsedStorageLength)
         storageAnchor.autosaveName = "BarrStorageAnchor"
-        storageAnchor.button?.image = nil
-        storageAnchor.button?.title = ""
-        storageAnchor.button?.toolTip = "Barr storage boundary"
+        if let storageButton = storageAnchor.button {
+            storageButton.image = nil
+            storageButton.title = ""
+            storageButton.toolTip = nil
+            storageButton.isEnabled = false
+            storageButton.alphaValue = 0
+            storageButton.setAccessibilityElement(false)
+        }
+    }
+
+    private func membershipAnchor(
+        for item: MenuBarItem,
+        moveToBarr: Bool
+    ) -> (CGWindowID, CGRect)? {
+        if moveToBarr {
+            guard
+                let windowID = windowID(for: storageAnchor),
+                let frame = PrivateWindowServer.frame(of: windowID)
+            else { return nil }
+            return (windowID, frame)
+        }
+
+        if
+            let neighbor = model.returnAnchor(for: item),
+            let frame = PrivateWindowServer.frame(of: neighbor.windowID)
+        {
+            return (neighbor.windowID, frame)
+        }
+
+        if
+            let windowID = windowID(for: storageAnchor),
+            let frame = PrivateWindowServer.frame(of: windowID)
+        {
+            return (windowID, frame)
+        }
+
+        guard
+            let windowID = windowID(for: statusItem),
+            let frame = PrivateWindowServer.frame(of: windowID)
+        else { return nil }
+        return (windowID, frame)
+    }
+
+    private func refreshScannerExclusions() {
+        let windowIDs = [windowID(for: statusItem), windowID(for: storageAnchor)]
+            .compactMap { $0 }
+        MenuBarScanner.setExcludedWindowIDs(Set(windowIDs))
     }
 
     private func setPreferredPosition(
@@ -279,15 +388,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Tahoe hosts status items in another process, so NSWindow.windowNumber
         // can be -1. Resolve our item from its horizontal screen geometry.
         let buttonFrame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        let maximumScore = max(100, buttonFrame.width * 0.2)
         return PrivateWindowServer.menuBarWindowIDs()
             .compactMap { windowID -> (CGWindowID, CGFloat)? in
-                guard let frame = PrivateWindowServer.frame(of: windowID), frame.width < 240 else {
+                guard
+                    let frame = PrivateWindowServer.frame(of: windowID),
+                    frame.width > 0,
+                    abs(frame.height - buttonFrame.height) < 20
+                else {
                     return nil
                 }
                 let score = abs(frame.midX - buttonFrame.midX) + abs(frame.width - buttonFrame.width) * 2
                 return (windowID, score)
             }
-            .filter { $0.1 < 100 }
+            .filter { $0.1 < maximumScore }
             .min { $0.1 < $1.1 }?
             .0
     }
@@ -310,6 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showShelf() {
         guard let button = statusItem.button else { return }
+        refreshScannerExclusions()
         model.refresh()
         shelfPanel.show(relativeTo: button)
     }
@@ -329,6 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func environmentChanged() {
         shelfPanel?.close()
+        refreshScannerExclusions()
         model.refresh()
     }
 

@@ -20,9 +20,11 @@ final class ShelfModel: ObservableObject {
     private var refreshGeneration = 0
     private var permissionPoller: AnyCancellable?
     private var requestedScreenCaptureThisLaunch = false
+    private var itemOrder: [String]
 
     init() {
         movedItemKeys = Set(UserDefaults.standard.stringArray(forKey: "BarrMovedItemKeys") ?? [])
+        itemOrder = UserDefaults.standard.stringArray(forKey: "BarrItemOrder") ?? []
         permissionPoller = Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -31,11 +33,11 @@ final class ShelfModel: ObservableObject {
     }
 
     var barrItems: [MenuBarItem] {
-        items.filter { movedItemKeys.contains($0.storageKey) }
+        ordered(items.filter { movedItemKeys.contains($0.storageKey) })
     }
 
     var menuBarItems: [MenuBarItem] {
-        items.filter { !movedItemKeys.contains($0.storageKey) }
+        ordered(items.filter { !movedItemKeys.contains($0.storageKey) })
     }
 
     func refresh() {
@@ -50,7 +52,9 @@ final class ShelfModel: ObservableObject {
             let found = MenuBarScanner.scan()
             DispatchQueue.main.async {
                 guard let self, generation == self.refreshGeneration else { return }
+                self.migrateLegacyKeys(using: found)
                 self.items = found
+                self.mergeItemOrder(found)
                 self.canCaptureScreen = PermissionCenter.canCaptureScreen || found.contains { $0.image != nil }
                 self.canUseAccessibility = PermissionCenter.isAccessibilityGranted
                 self.screenCaptureNeedsRestart = self.requestedScreenCaptureThisLaunch && !self.canCaptureScreen
@@ -85,8 +89,21 @@ final class ShelfModel: ObservableObject {
         onItemsChanged?()
     }
 
+    func returnAnchor(for item: MenuBarItem) -> MenuBarItem? {
+        guard let itemIndex = itemOrder.firstIndex(of: item.storageKey) else { return nil }
+        let currentByKey = items.reduce(into: [String: MenuBarItem]()) { result, current in
+            result[current.storageKey] = current
+        }
+        // Command-dragging beside a status item inserts after that item on
+        // current macOS releases, so anchor to the closest visible predecessor.
+        return itemOrder.prefix(itemIndex).reversed().lazy
+            .filter { !self.movedItemKeys.contains($0) }
+            .compactMap { currentByKey[$0] }
+            .first
+    }
+
     private func changeMembership(of item: MenuBarItem, moveToBarr: Bool) {
-        guard !movingItemKeys.contains(item.storageKey) else { return }
+        guard movingItemKeys.isEmpty else { return }
         movingItemKeys.insert(item.storageKey)
 
         onMembershipChange?(item, moveToBarr) { [weak self] success in
@@ -101,6 +118,55 @@ final class ShelfModel: ObservableObject {
                 UserDefaults.standard.set(self.movedItemKeys.sorted(), forKey: "BarrMovedItemKeys")
             }
             self.onItemsChanged?()
+        }
+    }
+
+    private func ordered(_ source: [MenuBarItem]) -> [MenuBarItem] {
+        let indexes = itemOrder.enumerated().reduce(into: [String: Int]()) { result, entry in
+            if result[entry.element] == nil { result[entry.element] = entry.offset }
+        }
+        return source.sorted {
+            let lhs = indexes[$0.storageKey] ?? Int.max
+            let rhs = indexes[$1.storageKey] ?? Int.max
+            if lhs == rhs { return $0.frame.minX < $1.frame.minX }
+            return lhs < rhs
+        }
+    }
+
+    private func mergeItemOrder(_ found: [MenuBarItem]) {
+        var known = Set(itemOrder)
+        var changed = false
+        for item in found where known.insert(item.storageKey).inserted {
+            itemOrder.append(item.storageKey)
+            changed = true
+        }
+        if changed {
+            UserDefaults.standard.set(itemOrder, forKey: "BarrItemOrder")
+        }
+    }
+
+    private func migrateLegacyKeys(using found: [MenuBarItem]) {
+        var movedChanged = false
+        var orderChanged = false
+
+        for item in found where item.storageKey != item.legacyStorageKey {
+            if movedItemKeys.remove(item.legacyStorageKey) != nil {
+                movedItemKeys.insert(item.storageKey)
+                movedChanged = true
+            }
+            for index in itemOrder.indices where itemOrder[index] == item.legacyStorageKey {
+                itemOrder[index] = item.storageKey
+                orderChanged = true
+            }
+        }
+
+        if orderChanged {
+            var seen = Set<String>()
+            itemOrder = itemOrder.filter { seen.insert($0).inserted }
+            UserDefaults.standard.set(itemOrder, forKey: "BarrItemOrder")
+        }
+        if movedChanged {
+            UserDefaults.standard.set(movedItemKeys.sorted(), forKey: "BarrMovedItemKeys")
         }
     }
 

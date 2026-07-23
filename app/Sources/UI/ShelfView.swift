@@ -118,7 +118,11 @@ struct ShelfView: View {
                     action(item)
                 } label: {
                     Group {
-                        if let image = item.image {
+                        if let symbolName = item.systemSymbolName {
+                            Image(systemName: symbolName)
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(.primary)
+                        } else if let image = item.image {
                             Image(nsImage: image)
                                 .resizable()
                                 .interpolation(.high)
@@ -135,7 +139,7 @@ struct ShelfView: View {
                     .opacity(model.movingItemKeys.contains(item.storageKey) ? 0.35 : 1)
                 }
                 .buttonStyle(ShelfButtonStyle())
-                .disabled(model.movingItemKeys.contains(item.storageKey))
+                .disabled(!model.movingItemKeys.isEmpty)
                 .help(item.displayName)
                 .accessibilityLabel(item.displayName)
             }

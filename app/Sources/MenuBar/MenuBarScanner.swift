@@ -2,10 +2,30 @@ import AppKit
 import CoreGraphics
 
 enum MenuBarScanner {
-    static func scan() -> [MenuBarItem] {
+    private static let exclusionLock = NSLock()
+    private static let scanLock = NSLock()
+    private nonisolated(unsafe) static var excludedWindowIDs = Set<CGWindowID>()
+    private nonisolated(unsafe) static var windowIDBySourceKey = [String: CGWindowID]()
+
+    static func setExcludedWindowIDs(_ windowIDs: Set<CGWindowID>) {
+        exclusionLock.lock()
+        excludedWindowIDs = windowIDs
+        exclusionLock.unlock()
+    }
+
+    static func scan(captureImages: Bool = true) -> [MenuBarItem] {
+        scanLock.lock()
+        defer { scanLock.unlock() }
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        let rawWindows = PrivateWindowServer.menuBarWindowIDs().compactMap(rawWindow)
-        let sources = accessibilitySources()
+        exclusionLock.lock()
+        let excluded = excludedWindowIDs
+        exclusionLock.unlock()
+        let rawWindows = PrivateWindowServer.menuBarWindowIDs()
+            .filter { !excluded.contains($0) }
+            .compactMap(rawWindow)
+        let sources = accessibilitySources().filter {
+            $0.frame.width > 0 && $0.frame.height > 0
+        }
         var claimedWindowIDs = Set<CGWindowID>()
         var items = [MenuBarItem]()
 
@@ -15,15 +35,24 @@ enum MenuBarScanner {
         // describes the app's logical status item while WindowServer exposes a
         // padded/reflowed host window, so their centers are no longer identical.
         for source in sources.sorted(by: { $0.frame.width > $1.frame.width }) {
-            guard let match = rawWindows
-                .filter({ !claimedWindowIDs.contains($0.windowID) })
-                .map({ ($0, matchCost($0.frame, source.frame)) })
-                .filter({ $0.1 <= 220 })
-                .min(by: { $0.1 < $1.1 })?.0
-            else { continue }
+            let available = rawWindows.filter { !claimedWindowIDs.contains($0.windowID) }
+            let previousMatch: RawWindow? = windowIDBySourceKey[source.sourceKey].flatMap { previousID in
+                guard !claimedWindowIDs.contains(previousID) else { return nil }
+                // WindowServer drops status-item windows from the menu-bar list
+                // once Barr parks them beyond the screen edge. Their IDs and
+                // private frames remain valid, so keep using that exact window
+                // instead of relabelling a visible neighbor with similar geometry.
+                return available.first { $0.windowID == previousID } ?? rawWindow(previousID)
+            }
+            let geometricMatch = available
+                .map { ($0, matchCost($0.frame, source.frame)) }
+                .filter { $0.1 <= 220 }
+                .min { $0.1 < $1.1 }?.0
+            guard let match = previousMatch ?? geometricMatch else { continue }
 
             claimedWindowIDs.insert(match.windowID)
-            items.append(makeItem(window: match, source: source))
+            windowIDBySourceKey[source.sourceKey] = match.windowID
+            items.append(makeItem(window: match, source: source, captureImages: captureImages))
         }
 
         // Pre-Tahoe and a few unusual helpers still own their status windows.
@@ -31,8 +60,7 @@ enum MenuBarScanner {
             guard
                 window.ownerPID != ownPID,
                 window.ownerName != "Window Server",
-                let app = NSRunningApplication(processIdentifier: window.ownerPID),
-                app.bundleIdentifier?.hasPrefix("com.apple.") != true
+                let app = NSRunningApplication(processIdentifier: window.ownerPID)
             else { continue }
 
             let source = AccessibilitySource(
@@ -40,9 +68,10 @@ enum MenuBarScanner {
                 ownerName: app.localizedName ?? window.ownerName,
                 bundleIdentifier: app.bundleIdentifier,
                 title: window.title,
+                stableIdentifier: nil,
                 frame: window.frame
             )
-            items.append(makeItem(window: window, source: source))
+            items.append(makeItem(window: window, source: source, captureImages: captureImages))
         }
 
         return items
@@ -55,7 +84,7 @@ enum MenuBarScanner {
     }
 
     static func item(windowID: CGWindowID) -> MenuBarItem? {
-        scan().first { $0.windowID == windowID }
+        scan(captureImages: false).first { $0.windowID == windowID }
     }
 
     private struct RawWindow {
@@ -72,7 +101,13 @@ enum MenuBarScanner {
         let ownerName: String
         let bundleIdentifier: String?
         let title: String?
+        let stableIdentifier: String?
         let frame: CGRect
+
+        var sourceKey: String {
+            [bundleIdentifier ?? ownerName, stableIdentifier ?? title ?? ownerName]
+                .joined(separator: "|")
+        }
     }
 
     private static func rawWindow(_ windowID: CGWindowID) -> RawWindow? {
@@ -92,16 +127,21 @@ enum MenuBarScanner {
         )
     }
 
-    private static func makeItem(window: RawWindow, source: AccessibilitySource) -> MenuBarItem {
+    private static func makeItem(
+        window: RawWindow,
+        source: AccessibilitySource,
+        captureImages: Bool
+    ) -> MenuBarItem {
         MenuBarItem(
             windowID: window.windowID,
             ownerPID: source.ownerPID,
             ownerName: source.ownerName,
             bundleIdentifier: source.bundleIdentifier,
             title: source.title ?? window.title,
+            stableIdentifier: source.stableIdentifier,
             frame: window.frame,
             isOnScreen: window.isOnScreen,
-            image: capture(windowID: window.windowID)
+            image: captureImages ? capture(windowID: window.windowID) : nil
         )
     }
 
@@ -110,11 +150,13 @@ enum MenuBarScanner {
         let ownPID = ProcessInfo.processInfo.processIdentifier
 
         return NSWorkspace.shared.runningApplications.flatMap { app -> [AccessibilitySource] in
+            let bundleIdentifier = app.bundleIdentifier
+            let isSystemStatusProvider = bundleIdentifier == "com.apple.controlcenter" ||
+                bundleIdentifier == "com.apple.systemuiserver"
             guard
                 app.processIdentifier != ownPID,
                 !app.isTerminated,
-                app.activationPolicy != .prohibited,
-                app.bundleIdentifier?.hasPrefix("com.apple.") != true
+                app.activationPolicy != .prohibited
             else { return [] }
 
             let appElement = AXUIElementCreateApplication(app.processIdentifier)
@@ -123,16 +165,76 @@ enum MenuBarScanner {
                 return []
             }
 
-            return axChildren(extras).compactMap { child in
-                guard let frame = axFrame(child) else { return nil }
+            let children = axChildren(extras).compactMap { child -> (AXUIElement, CGRect)? in
+                guard let frame = axFrame(child), frame.width > 0, frame.height > 0 else {
+                    return nil
+                }
+                return (child, frame)
+            }
+            let useBundleIdentity = !isSystemStatusProvider && children.count == 1
+
+            return children.map { pair in
+                let (child, frame) = pair
+                let title = statusItemName(child, useSystemFallbacks: isSystemStatusProvider)
+                let rawIdentifier = axString(child, attribute: kAXIdentifierAttribute as CFString)
+                    .flatMap { $0.isEmpty ? nil : $0 }
+                let stableIdentifier: String?
+                if isSystemStatusProvider {
+                    stableIdentifier = statusItemIdentifier(child)
+                } else if let rawIdentifier {
+                    stableIdentifier = rawIdentifier
+                } else if useBundleIdentity {
+                    stableIdentifier = ""
+                } else {
+                    stableIdentifier = title
+                }
+
                 return AccessibilitySource(
                     ownerPID: app.processIdentifier,
                     ownerName: app.localizedName ?? app.bundleIdentifier ?? "Menu bar app",
-                    bundleIdentifier: app.bundleIdentifier,
-                    title: axString(child, attribute: kAXTitleAttribute as CFString),
+                    bundleIdentifier: bundleIdentifier,
+                    title: title,
+                    stableIdentifier: stableIdentifier,
                     frame: frame
                 )
             }
+        }
+    }
+
+    private static func statusItemName(
+        _ element: AXUIElement,
+        useSystemFallbacks: Bool
+    ) -> String? {
+        // Preserve third-party titles exactly. Some apps expose an empty title,
+        // and that value is part of their identity in existing Barr installs.
+        guard useSystemFallbacks else {
+            return axString(element, attribute: kAXTitleAttribute as CFString)
+        }
+
+        return [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+            .compactMap { axString(element, attribute: $0 as CFString) }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private static func statusItemIdentifier(_ element: AXUIElement) -> String? {
+        if
+            let identifier = axString(element, attribute: kAXIdentifierAttribute as CFString),
+            !identifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return identifier
+        }
+
+        let label = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+            .compactMap { axString(element, attribute: $0 as CFString) }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? ""
+        let canonicalNames = [
+            "Screen Mirroring", "Keyboard Brightness", "Control Center",
+            "Now Playing", "Time Machine", "User Switching", "Bluetooth",
+            "Spotlight", "Battery", "Wi-Fi", "Wi‑Fi", "Sound", "Display",
+            "Focus", "AirDrop", "Clock", "VPN"
+        ]
+        return canonicalNames.first {
+            label.localizedCaseInsensitiveContains($0)
         }
     }
 

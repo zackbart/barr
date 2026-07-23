@@ -79,7 +79,15 @@ git push origin v0.1.0
 ```
 
 The release workflow expects the same Apple signing secrets used by the other
-Cursor Kittens macOS apps.
+Cursor Kittens macOS apps. GitHub secrets are repository-scoped, so add these
+to `zackbart/barr` before pushing the first tag:
+
+- `BUILD_CERTIFICATE_BASE64`
+- `P12_PASSWORD`
+- `APPLE_TEAM_ID`
+- `AC_API_KEY_BASE64`
+- `AC_API_KEY_ID`
+- `AC_API_ISSUER_ID`
 
 ## License
 
