@@ -19,18 +19,17 @@
   </a>
 </p>
 
-Barr gives macOS menu bar apps a second home in a compact dropdown shelf. It is
-built for MacBooks where the notch can crowd useful status items out of sight.
-
-Nothing moves on its own. Open Barr, choose exactly which menu bar apps belong
-in the shelf, and leave everything else in the native menu bar.
+Barr clears space in your macOS menu bar by moving the apps you choose into a
+compact dropdown shelf. Your apps keep running, their icons stay within reach,
+and everything else remains in the native menu bar. It is especially useful on
+MacBooks where the notch leaves little room for status items.
 
 ## How it works
 
-1. Click Barr's three-line menu bar icon.
-2. Click **Choose Apps** (or the slider button).
-3. Click an icon under **Menu Bar** to move it into **In Barr**.
-4. Click an icon under **In Barr** to return it to the native menu bar.
+1. Open **Choose Apps** and select the menu bar items you want Barr to hold.
+2. Barr hides those items from the menu bar and mirrors them in its shelf.
+3. Click Barr's three-line icon to open the shelf, then click any item to use it
+   normally. You can move an item back to the menu bar at any time.
 
 Barr needs **Screen Recording** to mirror each selected icon and
 **Accessibility** to move and activate the original status item. Processing stays
