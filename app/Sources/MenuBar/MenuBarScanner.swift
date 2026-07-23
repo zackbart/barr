@@ -69,7 +69,8 @@ enum MenuBarScanner {
             guard
                 window.ownerPID != ownPID,
                 window.ownerName != "Window Server",
-                let app = NSRunningApplication(processIdentifier: window.ownerPID)
+                let app = NSRunningApplication(processIdentifier: window.ownerPID),
+                !isBarrApplication(app)
             else { continue }
 
             let source = AccessibilitySource(
@@ -165,7 +166,8 @@ enum MenuBarScanner {
             guard
                 app.processIdentifier != ownPID,
                 !app.isTerminated,
-                app.activationPolicy != .prohibited
+                app.activationPolicy != .prohibited,
+                !isBarrApplication(app)
             else { return [] }
 
             let appElement = AXUIElementCreateApplication(app.processIdentifier)
@@ -207,6 +209,15 @@ enum MenuBarScanner {
                     frame: frame
                 )
             }
+        }
+    }
+
+    private static func isBarrApplication(_ application: NSRunningApplication) -> Bool {
+        switch application.bundleIdentifier {
+        case "com.cursorkittens.Barr", "com.cursorkittens.Barr.debug":
+            return true
+        default:
+            return false
         }
     }
 

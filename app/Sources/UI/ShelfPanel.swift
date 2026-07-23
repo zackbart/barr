@@ -31,20 +31,23 @@ final class ShelfPanel: NSPanel {
 
     @discardableResult
     func show(relativeTo button: NSStatusBarButton) -> Bool {
-        resizeToFit()
         guard let buttonWindow = button.window, let screen = buttonWindow.screen ?? NSScreen.main else {
             return false
         }
+        resizeToFit(on: screen)
         let buttonFrame = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        let x = min(max(screen.visibleFrame.minX + 8, buttonFrame.midX - frame.width / 2), screen.visibleFrame.maxX - frame.width - 8)
+        let minimumX = screen.visibleFrame.minX + 8
+        let maximumX = max(minimumX, screen.visibleFrame.maxX - frame.width - 8)
+        let x = min(max(minimumX, buttonFrame.midX - frame.width / 2), maximumX)
         let y = buttonFrame.minY - frame.height - 5
         setFrameOrigin(NSPoint(x: x, y: y))
         orderFrontRegardless()
         return true
     }
 
-    func resizeToFit() {
-        let screenWidth = (NSScreen.main?.visibleFrame.width ?? 800) - 32
+    func resizeToFit(on targetScreen: NSScreen? = nil) {
+        let sizingScreen = targetScreen ?? (isVisible ? screen : nil) ?? NSScreen.main
+        let screenWidth = max((sizingScreen?.visibleFrame.width ?? 800) - 32, 200)
         let desiredWidth: CGFloat
         let desiredHeight: CGFloat
 

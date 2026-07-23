@@ -2,6 +2,16 @@
 
 All notable changes to Barr are documented here.
 
+## [0.0.3] - 2026-07-23
+
+### Fixed
+
+- Allowed adding the first visible item when Barr still remembers hidden items
+  whose apps are not currently running.
+- Prevented Debug and Release instances from offering each other's controls and
+  invisible storage anchors as movable menu bar items.
+- Sized and clamped the shelf to the display containing Barr's menu bar control.
+
 ## [0.0.2] - 2026-07-23
 
 ### Added
@@ -41,5 +51,6 @@ All notable changes to Barr are documented here.
 
 - Initial signed and notarized release.
 
+[0.0.3]: https://github.com/zackbart/barr/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/zackbart/barr/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/zackbart/barr/releases/tag/v0.0.1

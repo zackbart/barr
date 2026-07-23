@@ -364,7 +364,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let generation = storageUpdateGeneration
         let keepShelfOpen = shelfPanel?.isVisible == true
 
-        guard !model.movedItemKeys.isEmpty, !model.barrItems.isEmpty else {
+        // Do not expand the anchor for an optimistic move. If Barr only
+        // remembers items whose apps are no longer running, barrItems contains
+        // the pending item before it has physically moved. Expanding here can
+        // make the anchor unresolvable and cause that first move to fail.
+        guard model.hasVisiblePersistedBarrItems else {
             storageAnchor.length = collapsedStorageLength
             refreshScannerExclusions()
             repositionShelfIfNeeded(keepOpen: keepShelfOpen)

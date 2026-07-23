@@ -43,6 +43,10 @@ final class ShelfModel: ObservableObject {
         ordered(items.filter { isInBarr($0.storageKey) })
     }
 
+    var hasVisiblePersistedBarrItems: Bool {
+        items.contains { movedItemKeys.contains($0.storageKey) }
+    }
+
     var menuBarItems: [MenuBarItem] {
         ordered(
             items.filter {
