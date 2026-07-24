@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import ServiceManagement
 
 @MainActor
@@ -19,14 +18,18 @@ final class ShelfModel: ObservableObject {
     @Published private(set) var loginItemError: String?
 
     var onItemsChanged: (() -> Void)?
+    var onLayoutChanged: (() -> Void)?
     var onRefreshCompleted: (() -> Void)?
     var onActivate: ((MenuBarItem) -> Void)?
     var onRestart: (() -> Void)?
     var onMembershipChange: ((MenuBarItem, Bool, @escaping (Bool) -> Void) -> Void)?
-    private var refreshGeneration = 0
-    private var permissionPoller: AnyCancellable?
+    private var refreshInProgress = false
+    private var refreshRequested = false
+    private var refreshRequestedCaptureImages = false
+    private var permissionCheckGeneration = 0
     private var requestedScreenCaptureThisLaunch = false
     private var itemOrder: [String]
+    private var itemOrderIndexes: [String: Int]
 
     private struct PendingMembershipChange {
         let itemKey: String
@@ -35,17 +38,14 @@ final class ShelfModel: ObservableObject {
 
     init() {
         let loginItemStatus = SMAppService.mainApp.status
+        let storedItemOrder = UserDefaults.standard.stringArray(forKey: "BarrItemOrder") ?? []
         movedItemKeys = Set(UserDefaults.standard.stringArray(forKey: "BarrMovedItemKeys") ?? [])
-        itemOrder = UserDefaults.standard.stringArray(forKey: "BarrItemOrder") ?? []
+        itemOrder = storedItemOrder
+        itemOrderIndexes = Self.orderIndexes(for: storedItemOrder)
         showsSystemItems = UserDefaults.standard.bool(forKey: "BarrShowsSystemItems")
         opensAtLogin = Self.isLoginItemRequested(loginItemStatus)
         loginItemRequiresApproval = loginItemStatus == .requiresApproval
         loginItemError = nil
-        permissionPoller = Timer.publish(every: 1, on: .main, in: .common)
-            .autoconnect()
-            .sink { [weak self] _ in
-                self?.updatePermissionState()
-            }
     }
 
     var barrItems: [MenuBarItem] {
@@ -68,18 +68,31 @@ final class ShelfModel: ObservableObject {
         pendingMembershipChange.map { [$0.itemKey] } ?? []
     }
 
-    func refresh() {
-        refreshGeneration += 1
-        let generation = refreshGeneration
-        isRefreshing = true
-        canCaptureScreen = PermissionCenter.canCaptureScreen
-        canUseAccessibility = PermissionCenter.isAccessibilityGranted
-        screenCaptureNeedsRestart = requestedScreenCaptureThisLaunch && !canCaptureScreen
+    func containsItem(ownedBy processIdentifier: pid_t) -> Bool {
+        items.contains { $0.ownerPID == processIdentifier }
+    }
+
+    func refresh(captureImages: Bool = true) {
+        guard !refreshInProgress else {
+            refreshRequested = true
+            refreshRequestedCaptureImages =
+                refreshRequestedCaptureImages || captureImages
+            return
+        }
+        beginRefresh(captureImages: captureImages)
+    }
+
+    private func beginRefresh(captureImages: Bool) {
+        refreshInProgress = true
+        if !isRefreshing {
+            isRefreshing = true
+        }
+        updatePermissionState(refreshWhenReady: false)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let found = MenuBarScanner.scan()
+            let found = MenuBarScanner.scan(captureImages: captureImages)
             DispatchQueue.main.async {
-                guard let self, generation == self.refreshGeneration else { return }
+                guard let self else { return }
                 self.migrateLegacyKeys(using: found)
                 let existingItems = Dictionary(
                     self.items.map { ($0.storageKey, $0) },
@@ -91,17 +104,32 @@ final class ShelfModel: ObservableObject {
                     }
                     return item.replacingImage(previousImage)
                 }
-                self.items = stableItems
+                let itemsChanged = !self.items.elementsEqual(
+                    stableItems,
+                    by: { $0.hasSameContent(as: $1) }
+                )
+                if itemsChanged {
+                    self.items = stableItems
+                }
                 self.mergeItemOrder(stableItems)
-                self.canCaptureScreen = PermissionCenter.canCaptureScreen
-                self.canUseAccessibility = PermissionCenter.isAccessibilityGranted
-                self.screenCaptureNeedsRestart = self.requestedScreenCaptureThisLaunch && !self.canCaptureScreen
-                self.isRefreshing = false
-                self.onItemsChanged?()
+                self.updatePermissionState(refreshWhenReady: false)
+                if itemsChanged {
+                    self.onItemsChanged?()
+                }
                 self.onRefreshCompleted?()
 #if DEBUG
                 print("[Barr] Found \(found.count) menu bar app item(s)")
 #endif
+
+                if self.refreshRequested {
+                    let nextRefreshCapturesImages = self.refreshRequestedCaptureImages
+                    self.refreshRequested = false
+                    self.refreshRequestedCaptureImages = false
+                    self.beginRefresh(captureImages: nextRefreshCapturesImages)
+                } else {
+                    self.refreshInProgress = false
+                    self.isRefreshing = false
+                }
             }
         }
     }
@@ -125,14 +153,15 @@ final class ShelfModel: ObservableObject {
     }
 
     func setManaging(_ managing: Bool) {
+        guard isManaging != managing else { return }
         isManaging = managing
-        onItemsChanged?()
+        onLayoutChanged?()
     }
 
     func setShowsSystemItems(_ showsSystemItems: Bool) {
+        guard self.showsSystemItems != showsSystemItems else { return }
         self.showsSystemItems = showsSystemItems
         UserDefaults.standard.set(showsSystemItems, forKey: "BarrShowsSystemItems")
-        onItemsChanged?()
     }
 
     func setOpensAtLogin(_ opensAtLogin: Bool) {
@@ -150,13 +179,18 @@ final class ShelfModel: ObservableObject {
         }
 
         refreshLoginItemStatus()
-        onItemsChanged?()
     }
 
     func refreshLoginItemStatus() {
         let status = SMAppService.mainApp.status
-        opensAtLogin = Self.isLoginItemRequested(status)
-        loginItemRequiresApproval = status == .requiresApproval
+        let shouldOpenAtLogin = Self.isLoginItemRequested(status)
+        let requiresApproval = status == .requiresApproval
+        if opensAtLogin != shouldOpenAtLogin {
+            opensAtLogin = shouldOpenAtLogin
+        }
+        if loginItemRequiresApproval != requiresApproval {
+            loginItemRequiresApproval = requiresApproval
+        }
     }
 
     func openLoginItemsSettings() {
@@ -211,14 +245,19 @@ final class ShelfModel: ObservableObject {
     }
 
     private func ordered(_ source: [MenuBarItem]) -> [MenuBarItem] {
-        let indexes = itemOrder.enumerated().reduce(into: [String: Int]()) { result, entry in
-            if result[entry.element] == nil { result[entry.element] = entry.offset }
-        }
         return source.sorted {
-            let lhs = indexes[$0.storageKey] ?? Int.max
-            let rhs = indexes[$1.storageKey] ?? Int.max
+            let lhs = itemOrderIndexes[$0.storageKey] ?? Int.max
+            let rhs = itemOrderIndexes[$1.storageKey] ?? Int.max
             if lhs == rhs { return $0.frame.minX < $1.frame.minX }
             return lhs < rhs
+        }
+    }
+
+    private static func orderIndexes(for order: [String]) -> [String: Int] {
+        order.enumerated().reduce(into: [String: Int]()) { result, entry in
+            if result[entry.element] == nil {
+                result[entry.element] = entry.offset
+            }
         }
     }
 
@@ -249,6 +288,7 @@ final class ShelfModel: ObservableObject {
             changed = true
         }
         if changed {
+            itemOrderIndexes = Self.orderIndexes(for: itemOrder)
             UserDefaults.standard.set(itemOrder, forKey: "BarrItemOrder")
         }
     }
@@ -271,6 +311,7 @@ final class ShelfModel: ObservableObject {
         if orderChanged {
             var seen = Set<String>()
             itemOrder = itemOrder.filter { seen.insert($0).inserted }
+            itemOrderIndexes = Self.orderIndexes(for: itemOrder)
             UserDefaults.standard.set(itemOrder, forKey: "BarrItemOrder")
         }
         if movedChanged {
@@ -299,14 +340,21 @@ final class ShelfModel: ObservableObject {
     }
 
     private func schedulePermissionChecks() {
-        for delay in [0.5, 1.5, 3.0] {
+        guard !canCaptureScreen || !canUseAccessibility else { return }
+        permissionCheckGeneration += 1
+        let generation = permissionCheckGeneration
+        for delay in [0.5, 1.5, 3.0, 6.0, 12.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.updatePermissionState()
+                guard
+                    let self,
+                    generation == self.permissionCheckGeneration
+                else { return }
+                self.updatePermissionState()
             }
         }
     }
 
-    private func updatePermissionState() {
+    private func updatePermissionState(refreshWhenReady: Bool = true) {
         let capture = PermissionCenter.canCaptureScreen
         let accessibility = PermissionCenter.isAccessibilityGranted
         let needsRestart = requestedScreenCaptureThisLaunch && !capture
@@ -320,9 +368,12 @@ final class ShelfModel: ObservableObject {
         canCaptureScreen = capture
         canUseAccessibility = accessibility
         screenCaptureNeedsRestart = needsRestart
-        onItemsChanged?()
+        onLayoutChanged?()
 
-        if becameReady {
+        if capture && accessibility {
+            permissionCheckGeneration += 1
+        }
+        if becameReady && refreshWhenReady {
             refresh()
         }
     }

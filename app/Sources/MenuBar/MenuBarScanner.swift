@@ -6,10 +6,18 @@ enum MenuBarScanner {
     private static let scanLock = NSLock()
     private nonisolated(unsafe) static var excludedWindowIDs = Set<CGWindowID>()
     private nonisolated(unsafe) static var windowIDBySourceKey = [String: CGWindowID]()
+    private nonisolated(unsafe) static var applicationIconByKey = [String: NSImage]()
+    private nonisolated(unsafe) static var noStatusItemCheckedAt = [pid_t: TimeInterval]()
+    // Rapid verification scans should not repeat a potentially blocking AX
+    // query for every ordinary app. One second still lets the delayed launch
+    // refresh discover status items that initialize asynchronously.
+    private static let negativeStatusItemCacheDuration: TimeInterval = 1
 
     static func setExcludedWindowIDs(_ windowIDs: Set<CGWindowID>) {
         exclusionLock.lock()
-        excludedWindowIDs = windowIDs
+        if excludedWindowIDs != windowIDs {
+            excludedWindowIDs = windowIDs
+        }
         exclusionLock.unlock()
     }
 
@@ -20,9 +28,9 @@ enum MenuBarScanner {
         exclusionLock.lock()
         let excluded = excludedWindowIDs
         exclusionLock.unlock()
-        let rawWindows = PrivateWindowServer.menuBarWindowIDs()
-            .filter { !excluded.contains($0) }
-            .compactMap(rawWindow)
+        let rawWindows = rawWindows(
+            for: PrivateWindowServer.menuBarWindowIDs().filter { !excluded.contains($0) }
+        )
         let sources = accessibilitySources().filter {
             $0.frame.width > 0 && $0.frame.height > 0
         }
@@ -84,6 +92,13 @@ enum MenuBarScanner {
             items.append(makeItem(window: window, source: source, captureImages: captureImages))
         }
 
+        let activeIconKeys = Set(items.map {
+            applicationIconKey(ownerPID: $0.ownerPID, bundleIdentifier: $0.bundleIdentifier)
+        })
+        applicationIconByKey = applicationIconByKey.filter {
+            activeIconKeys.contains($0.key)
+        }
+
         return items
             .sorted { lhs, rhs in
                 if lhs.frame.minX == rhs.frame.minX {
@@ -120,9 +135,32 @@ enum MenuBarScanner {
         }
     }
 
+    private static func rawWindows(for windowIDs: [CGWindowID]) -> [RawWindow] {
+        guard !windowIDs.isEmpty else { return [] }
+        let descriptions =
+            CGWindowListCreateDescriptionFromArray(windowIDs as CFArray)
+                as? [[CFString: Any]] ?? []
+        let descriptionsByID = descriptions.reduce(
+            into: [CGWindowID: [CFString: Any]]()
+        ) { result, description in
+            guard let number = description[kCGWindowNumber] as? NSNumber else { return }
+            result[CGWindowID(number.uint32Value)] = description
+        }
+        return windowIDs.compactMap {
+            rawWindow($0, description: descriptionsByID[$0])
+        }
+    }
+
     private static func rawWindow(_ windowID: CGWindowID) -> RawWindow? {
         let values = [windowID] as CFArray
         let description = (CGWindowListCreateDescriptionFromArray(values) as? [[CFString: Any]])?.first
+        return rawWindow(windowID, description: description)
+    }
+
+    private static func rawWindow(
+        _ windowID: CGWindowID,
+        description: [CFString: Any]?
+    ) -> RawWindow? {
         let describedFrame = (description?[kCGWindowBounds] as? NSDictionary)
             .flatMap(CGRect.init(dictionaryRepresentation:))
         guard let frame = PrivateWindowServer.frame(of: windowID) ?? describedFrame else { return nil }
@@ -142,7 +180,7 @@ enum MenuBarScanner {
         source: AccessibilitySource,
         captureImages: Bool
     ) -> MenuBarItem {
-        MenuBarItem(
+        return MenuBarItem(
             windowID: window.windowID,
             ownerPID: source.ownerPID,
             ownerName: source.ownerName,
@@ -151,18 +189,25 @@ enum MenuBarScanner {
             stableIdentifier: source.stableIdentifier,
             frame: window.frame,
             isOnScreen: window.isOnScreen,
-            image: captureImages ? capture(windowID: window.windowID, source: source) : nil
+            image: captureImages
+                ? capture(windowID: window.windowID, source: source)
+                : nil
         )
     }
 
     private static func accessibilitySources() -> [AccessibilitySource] {
         guard PermissionCenter.isAccessibilityGranted else { return [] }
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        let runningApplications = NSWorkspace.shared.runningApplications
+        let activeProcessIdentifiers = Set(runningApplications.map(\.processIdentifier))
+        noStatusItemCheckedAt = noStatusItemCheckedAt.filter {
+            activeProcessIdentifiers.contains($0.key)
+        }
+        let now = ProcessInfo.processInfo.systemUptime
 
-        return NSWorkspace.shared.runningApplications.flatMap { app -> [AccessibilitySource] in
+        return runningApplications.flatMap { app -> [AccessibilitySource] in
             let bundleIdentifier = app.bundleIdentifier
-            let isSystemStatusProvider = bundleIdentifier == "com.apple.controlcenter" ||
-                bundleIdentifier == "com.apple.systemuiserver"
+            let systemStatusProvider = isSystemStatusProvider(bundleIdentifier)
             guard
                 app.processIdentifier != ownPID,
                 !app.isTerminated,
@@ -170,9 +215,20 @@ enum MenuBarScanner {
                 !isBarrApplication(app)
             else { return [] }
 
+            if
+                !systemStatusProvider,
+                let lastNegativeCheck = noStatusItemCheckedAt[app.processIdentifier],
+                now - lastNegativeCheck < negativeStatusItemCacheDuration
+            {
+                return []
+            }
+
             let appElement = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(appElement, 0.15)
             guard let extras = axElement(appElement, attribute: kAXExtrasMenuBarAttribute as CFString) else {
+                if !systemStatusProvider {
+                    noStatusItemCheckedAt[app.processIdentifier] = now
+                }
                 return []
             }
 
@@ -182,15 +238,22 @@ enum MenuBarScanner {
                 }
                 return (child, frame)
             }
-            let useBundleIdentity = !isSystemStatusProvider && children.count == 1
+            if children.isEmpty {
+                if !systemStatusProvider {
+                    noStatusItemCheckedAt[app.processIdentifier] = now
+                }
+            } else {
+                noStatusItemCheckedAt.removeValue(forKey: app.processIdentifier)
+            }
+            let useBundleIdentity = !systemStatusProvider && children.count == 1
 
             return children.map { pair in
                 let (child, frame) = pair
-                let title = statusItemName(child, useSystemFallbacks: isSystemStatusProvider)
+                let title = statusItemName(child, useSystemFallbacks: systemStatusProvider)
                 let rawIdentifier = axString(child, attribute: kAXIdentifierAttribute as CFString)
                     .flatMap { $0.isEmpty ? nil : $0 }
                 let stableIdentifier: String?
-                if isSystemStatusProvider {
+                if systemStatusProvider {
                     stableIdentifier = statusItemIdentifier(child)
                 } else if let rawIdentifier {
                     stableIdentifier = rawIdentifier
@@ -219,6 +282,11 @@ enum MenuBarScanner {
         default:
             return false
         }
+    }
+
+    private static func isSystemStatusProvider(_ bundleIdentifier: String?) -> Bool {
+        bundleIdentifier == "com.apple.controlcenter" ||
+            bundleIdentifier == "com.apple.systemuiserver"
     }
 
     private static func statusItemName(
@@ -291,7 +359,27 @@ enum MenuBarScanner {
     }
 
     private static func owningApplicationIcon(for source: AccessibilitySource) -> NSImage? {
-        NSRunningApplication(processIdentifier: source.ownerPID)?.icon?.copy() as? NSImage
+        guard #available(macOS 26, *) else {
+            return NSRunningApplication(processIdentifier: source.ownerPID)?.icon?.copy() as? NSImage
+        }
+
+        let key = applicationIconKey(
+            ownerPID: source.ownerPID,
+            bundleIdentifier: source.bundleIdentifier
+        )
+        if let cachedIcon = applicationIconByKey[key] {
+            return cachedIcon
+        }
+        let icon = NSRunningApplication(processIdentifier: source.ownerPID)?.icon?.copy() as? NSImage
+        applicationIconByKey[key] = icon
+        return icon
+    }
+
+    private static func applicationIconKey(
+        ownerPID: pid_t,
+        bundleIdentifier: String?
+    ) -> String {
+        "\(ownerPID)|\(bundleIdentifier ?? "")"
     }
 
     private static func hasVisiblePixels(_ image: CGImage) -> Bool {

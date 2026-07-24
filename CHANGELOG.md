@@ -2,6 +2,14 @@
 
 All notable changes to Barr are documented here.
 
+## [0.0.6] - 2026-07-24
+
+### Changed
+
+- Eliminated Barr's persistent permission polling, coalesced overlapping menu
+  bar scans, batched WindowServer metadata reads, cached stable icon and item
+  identity data, and deferred background icon capture until the shelf is open.
+
 ## [0.0.5] - 2026-07-24
 
 ### Added
@@ -70,6 +78,7 @@ All notable changes to Barr are documented here.
 
 - Initial signed and notarized release.
 
+[0.0.6]: https://github.com/zackbart/barr/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/zackbart/barr/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/zackbart/barr/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/zackbart/barr/compare/v0.0.2...v0.0.3

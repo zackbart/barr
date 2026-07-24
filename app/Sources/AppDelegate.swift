@@ -35,8 +35,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startupReconciliationComplete = model.movedItemKeys.isEmpty
         refreshScannerExclusions()
         shelfPanel = ShelfPanel(model: model)
+        shelfPanel.resizeToFit()
         model.onItemsChanged = { [weak self] in
             self?.itemsChanged()
+        }
+        model.onLayoutChanged = { [weak self] in
+            self?.shelfPanel.resizeToFit()
         }
         model.onRefreshCompleted = { [weak self] in
             self?.refreshCompleted()
@@ -168,7 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func finishStartupReconciliation() {
         startupReconciliationComplete = true
-        model.refresh()
+        model.refresh(captureImages: false)
         updateStorageState()
         presentStartupShelfIfReady()
     }
@@ -197,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.persistedItemReconciliationInProgress = false
             if movedAnyItem {
-                self.model.refresh()
+                self.model.refresh(captureImages: self.shelfPanel?.isVisible == true)
             }
         }
     }
@@ -276,7 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startupReconciliationComplete || !PermissionCenter.isAccessibilityGranted
         else { return }
         startupShelfRequested = false
-        showShelf()
+        showShelf(refreshItems: false)
     }
 
     private func activateFromShelf(_ item: MenuBarItem) {
@@ -379,7 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 if parked {
                     self.updateStorageState()
-                    self.model.refresh()
+                    self.model.refresh(captureImages: false)
                 } else {
                     self.retryParking(originalItem, attempt: attempt)
                 }
@@ -389,7 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func retryParking(_ item: MenuBarItem, attempt: Int) {
         guard attempt < 2 else {
-            model.refresh()
+            model.refresh(captureImages: false)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
@@ -576,8 +580,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the pending item before it has physically moved. Expanding here can
         // make the anchor unresolvable and cause that first move to fail.
         guard model.hasVisiblePersistedBarrItems else {
-            storageAnchor.length = collapsedStorageLength
-            refreshScannerExclusions()
+            if abs(storageAnchor.length - collapsedStorageLength) > 0.5 {
+                storageAnchor.length = collapsedStorageLength
+                refreshScannerExclusions()
+            }
             repositionShelfIfNeeded(keepOpen: keepShelfOpen)
             return
         }
@@ -758,14 +764,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shelfPanel.isVisible ? closeShelf() : showShelf()
     }
 
-    private func showShelf(attempt: Int = 0) {
+    private func showShelf(attempt: Int = 0, refreshItems: Bool = true) {
+        if attempt == 0, refreshItems {
+            refreshScannerExclusions()
+            model.refreshLoginItemStatus()
+            model.refresh()
+        }
         guard let button = statusItem.button, button.window != nil else {
             retryShowingShelf(after: attempt)
             return
         }
-        refreshScannerExclusions()
-        model.refreshLoginItemStatus()
-        model.refresh()
         if shelfPanel.show(relativeTo: button) {
             installShelfDismissMonitors()
         } else {
@@ -777,7 +785,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func retryShowingShelf(after attempt: Int) {
         guard attempt < 10 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.showShelf(attempt: attempt + 1)
+            self?.showShelf(attempt: attempt + 1, refreshItems: false)
         }
     }
 
@@ -848,20 +856,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func environmentChanged() {
         closeShelf()
         refreshScannerExclusions()
-        model.refresh()
+        model.refresh(captureImages: false)
     }
 
-    @objc private func runningApplicationsChanged() {
+    @objc private func runningApplicationsChanged(_ notification: Notification) {
+        let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+            as? NSRunningApplication
+        if let application {
+            switch application.bundleIdentifier {
+            case "com.cursorkittens.Barr", "com.cursorkittens.Barr.debug":
+                return
+            default:
+                break
+            }
+            if
+                notification.name == NSWorkspace.didLaunchApplicationNotification,
+                application.activationPolicy == .prohibited
+            {
+                return
+            }
+            if
+                notification.name == NSWorkspace.didTerminateApplicationNotification,
+                !model.containsItem(ownedBy: application.processIdentifier)
+            {
+                return
+            }
+        }
+
         runningApplicationsGeneration += 1
         let generation = runningApplicationsGeneration
-        for delay in [0.6, 2.0] {
+        let delays = notification.name == NSWorkspace.didTerminateApplicationNotification
+            ? [0.4]
+            : [0.6, 2.0]
+        for delay in delays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard
                     let self,
                     generation == self.runningApplicationsGeneration
                 else { return }
                 self.refreshScannerExclusions()
-                self.model.refresh()
+                self.model.refresh(captureImages: self.shelfPanel?.isVisible == true)
             }
         }
     }
