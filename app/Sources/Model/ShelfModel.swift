@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import ServiceManagement
 
 @MainActor
 final class ShelfModel: ObservableObject {
@@ -13,6 +14,9 @@ final class ShelfModel: ObservableObject {
     @Published private(set) var screenCaptureNeedsRestart = false
     @Published var activationFailed = false
     @Published private(set) var showsSystemItems: Bool
+    @Published private(set) var opensAtLogin: Bool
+    @Published private(set) var loginItemRequiresApproval: Bool
+    @Published private(set) var loginItemError: String?
 
     var onItemsChanged: (() -> Void)?
     var onRefreshCompleted: (() -> Void)?
@@ -30,9 +34,13 @@ final class ShelfModel: ObservableObject {
     }
 
     init() {
+        let loginItemStatus = SMAppService.mainApp.status
         movedItemKeys = Set(UserDefaults.standard.stringArray(forKey: "BarrMovedItemKeys") ?? [])
         itemOrder = UserDefaults.standard.stringArray(forKey: "BarrItemOrder") ?? []
         showsSystemItems = UserDefaults.standard.bool(forKey: "BarrShowsSystemItems")
+        opensAtLogin = Self.isLoginItemRequested(loginItemStatus)
+        loginItemRequiresApproval = loginItemStatus == .requiresApproval
+        loginItemError = nil
         permissionPoller = Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -125,6 +133,38 @@ final class ShelfModel: ObservableObject {
         self.showsSystemItems = showsSystemItems
         UserDefaults.standard.set(showsSystemItems, forKey: "BarrShowsSystemItems")
         onItemsChanged?()
+    }
+
+    func setOpensAtLogin(_ opensAtLogin: Bool) {
+        let service = SMAppService.mainApp
+        loginItemError = nil
+
+        do {
+            if opensAtLogin {
+                try service.register()
+            } else {
+                try service.unregister()
+            }
+        } catch {
+            loginItemError = error.localizedDescription
+        }
+
+        refreshLoginItemStatus()
+        onItemsChanged?()
+    }
+
+    func refreshLoginItemStatus() {
+        let status = SMAppService.mainApp.status
+        opensAtLogin = Self.isLoginItemRequested(status)
+        loginItemRequiresApproval = status == .requiresApproval
+    }
+
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    private static func isLoginItemRequested(_ status: SMAppService.Status) -> Bool {
+        status == .enabled || status == .requiresApproval
     }
 
     func returnAnchor(for item: MenuBarItem) -> MenuBarItem? {

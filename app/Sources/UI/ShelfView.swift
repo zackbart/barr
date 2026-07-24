@@ -93,8 +93,65 @@ struct ShelfView: View {
                 )
             }
             .frame(height: 48)
+
+            Divider()
+                .padding(.horizontal, 10)
+
+            launchAtLoginSetting
         }
         .padding(.vertical, 7)
+    }
+
+    private var launchAtLoginSetting: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "power")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Open at Login")
+                    .font(.system(size: 11, weight: .medium))
+                Text(loginItemDetail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(
+                        model.loginItemError == nil ? Color.secondary : Color.red
+                    )
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            if model.loginItemRequiresApproval {
+                Button("Review…") {
+                    model.openLoginItemsSettings()
+                }
+                .controlSize(.small)
+            }
+
+            Toggle(
+                "Open at Login",
+                isOn: Binding(
+                    get: { model.opensAtLogin },
+                    set: model.setOpensAtLogin
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 38)
+    }
+
+    private var loginItemDetail: String {
+        if let error = model.loginItemError {
+            return error
+        }
+        if model.loginItemRequiresApproval {
+            return "Approval required in System Settings"
+        }
+        return "Start Barr automatically when you log in"
     }
 
     private func laneHeader<Trailing: View>(

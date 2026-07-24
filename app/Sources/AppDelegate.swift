@@ -764,6 +764,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         refreshScannerExclusions()
+        model.refreshLoginItemStatus()
         model.refresh()
         if shelfPanel.show(relativeTo: button) {
             installShelfDismissMonitors()
@@ -823,8 +824,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showContextMenu() {
+        model.refreshLoginItemStatus()
         let menu = NSMenu()
         menu.addItem(withTitle: "Refresh icons", action: #selector(refresh), keyEquivalent: "r").target = self
+        menu.addItem(.separator())
+        let openAtLoginItem = menu.addItem(
+            withTitle: "Open at Login",
+            action: #selector(toggleOpenAtLogin),
+            keyEquivalent: ""
+        )
+        openAtLoginItem.target = self
+        openAtLoginItem.state = model.opensAtLogin ? .on : .off
         menu.addItem(.separator())
         menu.addItem(withTitle: "Screen Recording settings…", action: #selector(openScreenRecordingSettings), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Accessibility settings…", action: #selector(openAccessibilitySettings), keyEquivalent: "").target = self
@@ -858,6 +868,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refresh() {
         model.refresh()
+    }
+
+    @objc private func toggleOpenAtLogin() {
+        model.setOpensAtLogin(!model.opensAtLogin)
     }
 
     @objc private func openScreenRecordingSettings() {

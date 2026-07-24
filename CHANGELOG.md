@@ -2,6 +2,13 @@
 
 All notable changes to Barr are documented here.
 
+## [0.0.5] - 2026-07-24
+
+### Added
+
+- Added an **Open at Login** option to Barr's manager and right-click menu,
+  including a shortcut to macOS Login Items settings when approval is needed.
+
 ## [0.0.4] - 2026-07-23
 
 ### Fixed
@@ -63,6 +70,7 @@ All notable changes to Barr are documented here.
 
 - Initial signed and notarized release.
 
+[0.0.5]: https://github.com/zackbart/barr/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/zackbart/barr/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/zackbart/barr/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/zackbart/barr/compare/v0.0.1...v0.0.2

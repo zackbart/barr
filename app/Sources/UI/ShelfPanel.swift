@@ -84,7 +84,7 @@ final class ShelfPanel: NSPanel {
             desiredHeight = 174
         } else if model.isManaging {
             desiredWidth = 520
-            desiredHeight = 170
+            desiredHeight = 210
         } else if model.barrItems.isEmpty {
             desiredWidth = 310
             desiredHeight = 74
